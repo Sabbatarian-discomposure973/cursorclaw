@@ -85,7 +85,7 @@ curl https://cursor.com/install -fsS | bash
 
 ```bash
 # 创建配置文件（从模板）
-cd /path/to/cursor-remote-control
+cd /path/to/cursorclaw
 cp projects.json.example projects.json
 # 编辑 projects.json，配置你的工作区路径
 

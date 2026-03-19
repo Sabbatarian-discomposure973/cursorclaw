@@ -59,7 +59,7 @@
 1. **克隆代码后**
    ```bash
    git clone <repo-url>
-   cd cursor-remote-control
+   cd cursorclaw
    ```
 
 2. **启动服务**

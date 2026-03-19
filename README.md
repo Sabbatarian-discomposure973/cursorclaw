@@ -162,7 +162,7 @@ curl https://cursor.com/install -fsS | bash
 ~/.local/bin/agent login
 
 # 4. 创建并配置文件
-cd /path/to/cursor-remote-control
+cd /path/to/cursorclaw
 
 # 创建项目路由配置
 cp projects.json.example projects.json

@@ -86,7 +86,7 @@ curl https://cursor.com/install -fsS | bash
 
 ```bash
 # Create configuration files from templates
-cd /path/to/cursor-remote-control
+cd /path/to/cursorclaw
 cp projects.json.example projects.json
 # Edit projects.json with your workspace paths
 
@@ -374,7 +374,7 @@ curl https://cursor.com/install -fsS | bash
 
 ```bash
 # 创建配置文件（从模板）
-cd /Users/你的用户名/work/cursor/cursor-remote-control
+cd /Users/你的用户名/work/cursor/cursorclaw
 cp projects.json.example projects.json
 # 编辑 projects.json，配置你的工作区路径
 
@@ -443,7 +443,7 @@ export PATH="$HOME/.local/bin:$PATH"
 # 在浏览器中完成登录（会显示登录成功的邮箱）
 
 # 4. 克隆项目（或进入已有项目）
-cd ~/work/cursor/cursor-remote-control
+cd ~/work/cursor/cursorclaw
 
 # 5. 创建配置文件（从模板）
 cp projects.json.example projects.json
@@ -675,7 +675,7 @@ tail -f /tmp/feishu-cursor.log | grep "chat_id\|open_id"
 **首次配置**（从模板创建）：
 
 ```bash
-cd /path/to/cursor-remote-control
+cd /path/to/cursorclaw
 cp projects.json.example projects.json
 nano projects.json
 ```

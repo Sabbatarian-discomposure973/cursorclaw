@@ -1442,7 +1442,7 @@ async function handleMessage(msg: any) {
 		// 解析项目路由（传入 intent 避免重复检测）
 		let { workspace, message, label, intent } = resolveWorkspace(text, currentProject, routeIntent);
 
-		// 检测定时任务请求，强制使用 cursor-remote-control 工作区（规则文件所在）
+		// 检测定时任务请求，强制使用 cursorclaw 工作区（规则文件所在）
 		const isScheduleRequest = /([0-9]+|一|二|三|四|五|六|七|八|九|十)(分钟|小时|天|周|月).*(后|提醒|通知|告诉)|每(天|周|月|小时).*[提醒通知]|定时/i.test(text);
 		if (isScheduleRequest) {
 			workspace = ROOT;

@@ -146,7 +146,7 @@ const WORKSPACE_RULES = [
 function ensureWorkspace(wsPath: string): boolean {
 	const normalizedWs = resolve(wsPath);
 	const normalizedRoot = resolve(ROOT);
-	// 仅在本项目（cursor-remote-control）目录下复制 AGENTS.md / .cursor 模板，不污染其他项目
+	// 仅在本项目（cursorclaw）目录下复制 AGENTS.md / .cursor 模板，不污染其他项目
 	const isOwnProject = normalizedWs === normalizedRoot;
 
 	if (!isOwnProject) {

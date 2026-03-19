@@ -1,5 +1,5 @@
 #!/bin/bash
-# 企业微信 Cursor Remote Control 服务管理脚本
+# 企业微信 CursorClaw 服务管理脚本
 # 基于 macOS launchd 实现开机自启动和崩溃自动恢复
 
 set -e
@@ -173,7 +173,7 @@ case "${1:-}" in
         show_logs
         ;;
     *)
-        echo "企业微信 Cursor Remote Control 服务管理"
+        echo "企业微信 CursorClaw 服务管理"
         echo ""
         echo "用法: bash service.sh {install|uninstall|start|stop|restart|status|logs}"
         echo ""

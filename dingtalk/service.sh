@@ -100,7 +100,7 @@ cmd_stop() {
     # 1. 路径匹配
     while IFS= read -r pid; do
         [[ -n "$pid" ]] && PIDS+=("$pid")
-    done < <(pgrep -f "cursor-remote-control/dingtalk" 2>/dev/null || true)
+    done < <(pgrep -f "cursorclaw/dingtalk" 2>/dev/null || true)
     
     # 2. lsof 查找工作目录匹配的进程
     while IFS= read -r pid; do

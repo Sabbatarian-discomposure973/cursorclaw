@@ -1,6 +1,6 @@
 # 贡献指南
 
-感谢你考虑为 Cursor Remote Control 做出贡献！
+感谢你考虑为 CursorClaw 做出贡献！
 
 ## 如何贡献
 

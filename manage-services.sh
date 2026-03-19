@@ -72,7 +72,7 @@ case "$1" in
         fi
         
         # 方案2：兜底清理（处理历史残留或 PID 文件丢失的情况）
-        pkill -9 -f "bun.*cursor-remote-control.*feishu" 2>/dev/null
+        pkill -9 -f "bun.*cursorclaw.*feishu" 2>/dev/null
         pkill -9 -f "caffeinate.*feishu" 2>/dev/null
         
         sleep 1
@@ -92,7 +92,7 @@ case "$1" in
         fi
         
         # 方案2：兜底清理
-        pkill -9 -f "bun.*cursor-remote-control.*dingtalk" 2>/dev/null
+        pkill -9 -f "bun.*cursorclaw.*dingtalk" 2>/dev/null
         pkill -9 -f "caffeinate.*dingtalk" 2>/dev/null
         
         sleep 1
@@ -112,7 +112,7 @@ case "$1" in
         fi
         
         # 方案2：兜底清理
-        pkill -9 -f "bun.*cursor-remote-control.*wecom" 2>/dev/null
+        pkill -9 -f "bun.*cursorclaw.*wecom" 2>/dev/null
         pkill -9 -f "caffeinate.*wecom" 2>/dev/null
         
         sleep 1
@@ -155,9 +155,9 @@ case "$1" in
           echo "  ⚠️  PID 文件不存在，使用兜底清理模式..."
         fi
         
-        pkill -9 -f "bun.*cursor-remote-control.*feishu" 2>/dev/null
-        pkill -9 -f "bun.*cursor-remote-control.*dingtalk" 2>/dev/null
-        pkill -9 -f "bun.*cursor-remote-control.*wecom" 2>/dev/null
+        pkill -9 -f "bun.*cursorclaw.*feishu" 2>/dev/null
+        pkill -9 -f "bun.*cursorclaw.*dingtalk" 2>/dev/null
+        pkill -9 -f "bun.*cursorclaw.*wecom" 2>/dev/null
         pkill -9 -f "caffeinate.*feishu" 2>/dev/null
         pkill -9 -f "caffeinate.*dingtalk" 2>/dev/null
         pkill -9 -f "caffeinate.*wecom" 2>/dev/null
@@ -165,10 +165,10 @@ case "$1" in
         sleep 1
         
         # 方案3：最终扫描，确保没有漏网之鱼
-        REMAINING=$(ps aux | grep -E "bun.*cursor-remote-control" | grep -E "feishu|dingtalk|wecom" | grep -v grep | wc -l)
+        REMAINING=$(ps aux | grep -E "bun.*cursorclaw" | grep -E "feishu|dingtalk|wecom" | grep -v grep | wc -l)
         if [ "$REMAINING" -gt 0 ]; then
           echo "  ⚠️  发现残留进程 ($REMAINING 个)，再次清理..."
-          ps aux | grep -E "bun.*cursor-remote-control" | grep -E "feishu|dingtalk|wecom" | grep -v grep | awk '{print $2}' | xargs kill -9 2>/dev/null
+          ps aux | grep -E "bun.*cursorclaw" | grep -E "feishu|dingtalk|wecom" | grep -v grep | awk '{print $2}' | xargs kill -9 2>/dev/null
           sleep 1
         fi
         
@@ -210,7 +210,7 @@ case "$1" in
     echo "📊 服务状态:"
     echo ""
     # 只统计 bun 进程，不包括 caffeinate
-    PROCESSES=$(ps aux | grep "bun.*cursor-remote-control" | grep -E "feishu|dingtalk|wecom" | grep -v grep | grep -v caffeinate)
+    PROCESSES=$(ps aux | grep "bun.*cursorclaw" | grep -E "feishu|dingtalk|wecom" | grep -v grep | grep -v caffeinate)
     COUNT=$(echo "$PROCESSES" | grep -c "bun" || echo "0")
     
     if [ "$COUNT" -ge 3 ]; then
@@ -252,7 +252,7 @@ case "$1" in
     ;;
     
   *)
-    echo "Cursor Remote Control - 服务管理"
+    echo "CursorClaw - 服务管理"
     echo ""
     echo "用法: bash manage-services.sh {start|stop|restart|status|logs} [feishu|dingtalk|wecom]"
     echo ""

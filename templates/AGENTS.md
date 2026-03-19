@@ -1,4 +1,4 @@
-# 钉钉 Cursor Remote Control
+# CursorClaw
 
 钉钉 → Cursor AI 远程遥控服务。
 

@@ -6,11 +6,11 @@
       "path": "/Users/你的用户名/Projects/示例项目",
       "description": "示例项目"
     },
-    "cursor-remote-control": {
-      "path": "/Users/你的用户名/work/cursor/cursor-remote-control",
-      "description": "Cursor远程控制项目"
+    "cursorclaw": {
+      "path": "/Users/你的用户名/work/cursor/cursorclaw",
+      "description": "CursorClaw远程控制项目"
     }
   },
-  "default_project": "cursor-remote-control",
-  "memory_workspace": "cursor-remote-control"
+  "default_project": "cursorclaw",
+  "memory_workspace": "cursorclaw"
 }

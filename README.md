@@ -1,14 +1,38 @@
 # CursorClaw
 
+<div align="center">
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-blue.svg)](https://www.typescriptlang.org/)
 [![Bun](https://img.shields.io/badge/Bun-1.x-333333.svg)](https://bun.sh)
+[![GitHub Stars](https://img.shields.io/github/stars/keunsy/cursorclaw?style=social)](https://github.com/keunsy/cursorclaw/stargazers)
+
+**通过飞书/钉钉/企业微信远程控制 Cursor AI 的智能助手**
+
+[快速开始](#快速开始) · [功能特性](#核心功能) · [文档](https://github.com/keunsy/cursorclaw#目录) · [贡献指南](CONTRIBUTING.md)
+
+</div>
+
+---
 
 > 基于 [feishu-cursor-claw](https://github.com/nongjun/feishu-cursor-claw) 改进，支持飞书、钉钉、企业微信三个平台。
 
-通过飞书、钉钉、企业微信远程控制 Cursor AI Agent 的中继服务。
+## ✨ 简介
 
-在手机上发消息，你的 Mac 就自动写代码、审文档、执行任务。将 Cursor 变成你的**私人 AI 战略合伙人**，随时随地通过 IM 调用。
+**CursorClaw** 是一个将 Cursor AI 接入 IM 平台的远程控制中继服务。
+
+📱 **在手机上发消息，Mac 上自动写代码、审文档、执行任务**  
+🤖 **将 Cursor 变成你的私人 AI 战略合伙人，随时随地通过 IM 调用**  
+🔄 **支持飞书、钉钉、企业微信，三个服务可同时运行**
+
+### 核心优势
+
+- 🌐 **无需公网 IP** - WebSocket 长连接，本地服务主动连接
+- 🧠 **持久记忆** - 跨会话记忆系统，AI 记住你的项目和偏好
+- 🎯 **项目路由** - 智能识别和切换多个工作区
+- ⏰ **定时任务** - AI 可创建定时提醒和周期任务
+- 💬 **会话管理** - 支持多会话历史、切换和归档
+- 🎙️ **多模态输入** - 文字、语音、图片、文件全支持
 
 ---
 

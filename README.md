@@ -32,7 +32,7 @@
 - 🎯 **项目路由** - 智能识别和切换多个工作区
 - ⏰ **定时任务** - AI 可创建定时提醒和周期任务
 - 💬 **会话管理** - 支持多会话历史、切换和归档
-- 🎙️ **多模态输入** - 文字、语音、图片、文件全支持
+- 🎙️ **多模态输入** - 文字、语音、图片、文件（飞书/钉钉）
 
 ---
 
@@ -143,16 +143,25 @@ cursorclaw/
 
 ## 功能特性
 
+### 核心功能（三平台通用）
 - 🚀 **三渠道支持**: 飞书、钉钉、企业微信独立部署，可同时运行
 - 💾 **记忆系统**: SQLite 向量数据库 + FTS5 全文搜索
 - ⏰ **定时任务**: AI 创建的 Cron 任务，自动执行并推送通知
-- 📰 **热点新闻推送**: 定时抓取多平台热榜并推送（微博/知乎/百度等）
 - ❤️ **心跳检查**: 定期后台维护（整理记忆、检查状态）
-- 🎙️ **语音识别**: 火山引擎豆包 STT → 本地 whisper-cpp 降级
-- 🖼️ **图片处理**: 自动下载和 OCR 识别
 - 📁 **项目路由**: 多工作区切换（共享配置）
 - 🔄 **会话连续性**: 自动 resume，多会话并发
 - 🧠 **身份人格**: OpenClaw 风格的持久记忆与人格系统
+
+### 扩展功能（飞书/钉钉）
+- 🎙️ **语音识别**: 火山引擎豆包 STT → 本地 whisper-cpp 降级
+- 🖼️ **图片处理**: 自动下载和 OCR 识别
+- 📁 **文件处理**: 支持各类文件上传下载
+- 📰 **热点新闻推送**: 定时抓取多平台热榜并推送（微博/知乎/百度等）
+- 📤 **文件发送**: 本地文件上传到 IM 平台
+
+### 企业微信特色
+- ⚡ **流式回复**: 主动推送（延迟更低）vs 飞书轮询刷新
+- 🎯 **MVP 优先**: 核心对话功能完整，扩展功能按需添加
 
 ---
 
@@ -312,9 +321,25 @@ bash manage-services.sh logs wecom       # 查看企业微信日志
 @机器人 /帮助
 ```
 
+### 功能差异说明
+
+各平台功能支持情况：
+
+| 功能类别 | 飞书 | 钉钉 | 企业微信 |
+|---------|------|------|---------|
+| 核心对话 | ✅ | ✅ | ✅ |
+| 语音识别 | ✅ | ✅ | ❌ |
+| 图片处理 | ✅ | ✅ | ❌ |
+| 文件上传/下载 | ✅ | ✅ | ❌ |
+| 新闻推送 | ✅ | ✅ | ❌ |
+| 流式回复 | 轮询刷新 | ❌ | ✅ 主动推送 |
+| 记忆/定时任务 | ✅ | ✅ | ✅ |
+
+> 💡 **企业微信**采用 MVP 策略，优先保证核心对话体验，扩展功能按需添加
+
 ### 常用指令
 
-三个渠道都支持以下指令：
+#### 核心指令（三平台通用）
 
 | 指令 | 中文别名 | 说明 |
 |------|----------|------|
@@ -328,10 +353,15 @@ bash manage-services.sh logs wecom       # 查看企业微信日志
 | `/memory 关键词` | `/记忆 关键词` | 语义搜索记忆 |
 | `/log 内容` | `/记录 内容` | 写入今日日记 |
 | `/任务` | `/cron` `/定时` | 查看/管理定时任务 |
+| `/心跳` | `/heartbeat` | 查看/管理心跳系统 |
+
+#### 扩展指令（飞书/钉钉专用）
+
+| 指令 | 中文别名 | 说明 |
+|------|----------|------|
 | `/新闻` | `/news` | **热点**：立即推送今日热点；或 `/新闻 每天9点 推送10条` 定时 |
 | `/新闻状态` | `/health` | 查看热点数据源健康状态 |
-| `/心跳` | `/heartbeat` | 查看/管理心跳系统 |
-| `/发送文件 <路径>` | `/sendfile` `/send` | **飞书专用** - 发送本地文件（最大 30MB） |
+| `/发送文件 <路径>` | `/sendfile` `/send` | 发送本地文件（最大 30MB） |
 
 ### 项目路由（多工作区）
 
@@ -364,7 +394,9 @@ cp projects.json.example projects.json
 
 ### 热点新闻定时推送 🆕
 
-在飞书、钉钉或企业微信对话中说：
+> ⚠️ **仅飞书和钉钉支持**，企业微信暂未实现
+
+在飞书或钉钉对话中说：
 
 > **每天 9 点推送热点**
 
@@ -380,9 +412,9 @@ cp projects.json.example projects.json
 
 ---
 
-### 文件发送功能（飞书专用）
+### 文件发送功能（飞书/钉钉）
 
-飞书服务支持发送本地文件到飞书：
+飞书和钉钉服务支持发送本地文件：
 
 ```
 /发送文件 ~/Desktop/report.pdf
@@ -400,9 +432,16 @@ cp projects.json.example projects.json
 也可以通过命令行直接发送文件：
 
 ```bash
+# 飞书
 cd feishu
 bun run send-file.ts /path/to/file.pdf <接收人ID>
+
+# 钉钉
+cd dingtalk
+bun run send-file-dingtalk.ts /path/to/file.pdf <接收人ID>
 ```
+
+> ⚠️ **企业微信暂不支持文件发送功能**
 
 详见：[feishu/发送文件到飞书.md](feishu/发送文件到飞书.md)
 
@@ -480,25 +519,35 @@ VOLC_EMBEDDING_MODEL=doubao-embedding-vision-250615
 
 ### 通用问题
 
-| 问题 | 原因 | 解决方案 |
-|------|------|----------|
-| `API Key 无效` | .env 中有无效占位符 | 运行 `agent login` 登录，注释掉 .env 中的 `CURSOR_API_KEY` |
-| `团队配额已用完` | 使用高消耗模型 | 改用 `auto` 模型（编辑 .env 中的 `CURSOR_MODEL=auto`） |
-| `permission denied /Users/user` | projects.json 路径错误 | 把 projects.json 中的 `/Users/user` 改为实际用户名 |
-| 语音识别乱码 | whisper 质量低 | 配置火山引擎 STT（`VOLC_STT_*` 变量） |
-| `agent: command not found` | Agent CLI 未安装 | `curl https://cursor.com/install -fsS \| bash` |
-| `bun: command not found` | Bun 未安装 | `curl -fsSL https://bun.sh/install \| bash` |
+| 问题 | 解决方案 |
+|------|----------|
+| **启动失败：找不到 agent 命令** | 安装 Cursor Agent CLI：`curl https://cursor.com/install -fsS \| bash` |
+| **启动失败：找不到 bun 命令** | 安装 Bun 运行时：`curl -fsSL https://bun.sh/install \| bash` |
+| **无响应：机器人收不到消息** | 检查服务状态：`bash service.sh status`，重启服务：`bash service.sh restart` |
+| **配额耗尽：提示团队配额用完** | 编辑 `.env` 将 `CURSOR_MODEL=opus-4.6-thinking` 改为 `auto`（自动选择最优模型） |
+| **路径错误：permission denied** | 从 `projects.json.example` 复制后，把 `/Users/你的用户名/` 改为实际路径 |
+| **语音识别质量差或乱码** | 配置火山引擎 STT（`.env` 中设置 `VOLC_STT_APP_ID` 和 `VOLC_STT_ACCESS_TOKEN`） |
+| **记忆搜索不可用** | 需要配置向量嵌入 API（`.env` 中设置 `VOLC_EMBEDDING_API_KEY`） |
 
-### 常见问题 FAQ
+### 常见问题
 
-**Q: 需要配置 Cursor API Key 吗？**  
-A: 不需要。运行 `agent login` 登录后会自动使用登录凭据。
+**Q: 必须配置 API Key 吗？**  
+A: 不必须。推荐用 `agent login` 登录，比手动配置 Key 更方便，且支持团队配额。
 
-**Q: 为什么提示配额用完？**  
-A: 默认 `opus-4.6-thinking` 消耗配额大，建议改用 `auto` 或 `sonnet-4`。
+**Q: 三个平台能同时用吗？**  
+A: 能。三个服务独立进程，互不干扰，共享项目配置（`projects.json`）和记忆数据库。
 
-**Q: 飞书、钉钉、企业微信可以同时运行吗？**  
-A: 可以！三个服务独立运行，互不干扰，共享 `projects.json` 配置和记忆系统。
+**Q: 如何切换工作区？**  
+A: 两种方式：① 对话中说「切换到 项目名」持久切换；② 在消息前加 `项目名:` 临时路由，如「docs: 帮我整理文档」。
+
+**Q: 定时任务怎么创建？**  
+A: 直接对话说「每天 9 点推送热点」或「3 分钟后提醒我喝水」，AI 会自动创建任务。查看任务用 `/任务` 指令。
+
+**Q: 怎么让 AI 记住信息？**  
+A: 对话中说「记住我喜欢用 TypeScript」或用 `/记录 今天完成了XX功能`，AI 会存入长期记忆并在后续对话中调用。
+
+**Q: 如何查看服务日志？**  
+A: 各服务目录下执行 `bash service.sh logs`，或查看 `/tmp/feishu-cursor.log` 等日志文件。
 
 ---
 
@@ -521,7 +570,9 @@ A: 可以！三个服务独立运行，互不干扰，共享 `projects.json` 配
 | 连接方式 | WebSocket 长连接 | Stream 长连接 | WebSocket 长连接 |
 | 流式回复 | 轮询刷新 | ❌ 不支持 | 主动推送 ⭐ |
 | 数据库 | SQLite（向量索引 + FTS5） | SQLite（向量索引 + FTS5） | SQLite（向量索引 + FTS5） |
-| 语音 | 火山引擎 → whisper-cpp | 火山引擎 → whisper-cpp | 火山引擎 → whisper-cpp |
+| 语音识别 | ✅ 火山引擎 → whisper-cpp | ✅ 火山引擎 → whisper-cpp | ❌ 暂未实现 |
+| 图片/文件 | ✅ 支持 | ✅ 支持 | ❌ 暂未实现 |
+| 新闻推送 | ✅ 支持 | ✅ 支持 | ❌ 暂未实现 |
 | 部署 | macOS launchd | macOS launchd | macOS launchd |
 
 **共享模块**（`shared/` 目录）：

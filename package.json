@@ -1,0 +1,11 @@
+{
+  "name": "cursorclaw",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "dependencies": {
+    "@vitalets/google-translate-api": "^9.2.1",
+    "fast-xml-parser": "^5.5.5",
+    "fastest-levenshtein": "^1.0.16"
+  }
+}

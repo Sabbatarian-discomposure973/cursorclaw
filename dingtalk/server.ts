@@ -1,0 +1,2610 @@
+/**
+ * 钉钉 Stream → Cursor Agent CLI 中继服务 v2
+ *
+ * 核心功能：
+ * - 钉钉消息 → Cursor CLI → 钉钉回复
+ * - 支持文字、语音、图片、文件
+ * - 会话管理（--resume）
+ * - 项目路由（传统 + 对话式）
+ * - 命令系统、定时任务、心跳检测、记忆搜索
+ *
+ * 启动: bun run server.ts
+ */
+
+import { DWClient, TOPIC_ROBOT } from 'dingtalk-stream';
+import { spawn } from 'node:child_process';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, watchFile, readdirSync, statSync } from 'node:fs';
+import { resolve } from 'node:path';
+import axios from 'axios';
+import { execFileSync } from 'node:child_process';
+import { Scheduler, type CronJob } from '../shared/scheduler.js';
+import { MemoryManager } from '../shared/memory.js';
+import { fetchNews } from '../shared/news-fetcher.js';
+import { getHealthStatus } from '../shared/news-sources/monitoring.js';
+import { HeartbeatRunner } from '../shared/heartbeat.js';
+import { humanizeCronInChinese } from 'cron-chinese';
+
+const HOME = process.env.HOME!;
+const ROOT = resolve(import.meta.dirname, '..');
+const ENV_PATH = resolve(import.meta.dirname, '.env');
+const PROJECTS_PATH = resolve(ROOT, 'projects.json');
+const INBOX_DIR = resolve(ROOT, 'inbox');
+const WHISPER_MODEL = resolve(HOME, 'models/ggml-tiny.bin');
+const BOOT_DELAY_MS = 8000;  // 启动自检延迟，确保服务完全启动
+
+mkdirSync(INBOX_DIR, { recursive: true });
+
+// 清理超过 24 小时的 inbox 文件
+const DAY_MS = 24 * 60 * 60 * 1000;
+for (const f of readdirSync(INBOX_DIR)) {
+	const p = resolve(INBOX_DIR, f);
+	try {
+		if (Date.now() - statSync(p).mtimeMs > DAY_MS) {
+			unlinkSync(p);
+			console.log(`[清理] 删除过期文件: ${f}`);
+		}
+	} catch {}
+}
+
+// 全局异常处理
+process.on('uncaughtException', (err) => {
+	console.error(`[致命异常] ${err.message}\n${err.stack}`);
+});
+process.on('unhandledRejection', (reason) => {
+	console.error('[Promise 异常]', reason);
+});
+
+// ── 工具函数 ──────────────────────────────────────
+function formatElapsed(seconds: number): string {
+	if (seconds < 60) return `${seconds}秒`;
+	const mins = Math.floor(seconds / 60);
+	const secs = seconds % 60;
+	if (mins >= 60) {
+		const hrs = Math.floor(mins / 60);
+		const remainMins = mins % 60;
+		if (remainMins === 0 && secs === 0) return `${hrs}时`;
+		if (secs === 0) return `${hrs}时${remainMins}分`;
+		return `${hrs}时${remainMins}分${secs}秒`;
+	}
+	return secs > 0 ? `${mins}分${secs}秒` : `${mins}分钟`;
+}
+
+function isQuotaError(error: Error): boolean {
+	const msg = (error instanceof Error ? error.message : String(error ?? '')).toLowerCase();
+	return /insufficient.*(balance|credit|quota)|余额不足|quota.*exceeded/i.test(msg);
+}
+
+/** 解析 cron 表达式为中文描述（使用 cron-chinese 库） */
+function parseCronToHuman(expr: string): string | null {
+	try {
+		return humanizeCronInChinese(expr);
+	} catch {
+		return null;
+	}
+}
+
+// ── 配置 ─────────────────────────────────────────
+interface EnvConfig {
+	CURSOR_API_KEY: string;
+	DINGTALK_APP_KEY: string;
+	DINGTALK_APP_SECRET: string;
+	CURSOR_MODEL: string;
+	VOLC_STT_APP_ID: string;
+	VOLC_STT_ACCESS_TOKEN: string;
+}
+
+function loadEnv(): EnvConfig {
+	if (!existsSync(ENV_PATH)) {
+		console.error(`[致命] .env 文件不存在: ${ENV_PATH}`);
+		process.exit(1);
+	}
+	const raw = readFileSync(ENV_PATH, 'utf-8');
+	const env: Record<string, string> = {};
+	for (const line of raw.split('\n')) {
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith('#')) continue;
+		const [key, ...vals] = trimmed.split('=');
+		let val = vals.join('=').trim();
+		if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+			val = val.slice(1, -1);
+		}
+		env[key.trim()] = val;
+	}
+	return {
+		CURSOR_API_KEY: env.CURSOR_API_KEY || '',
+		DINGTALK_APP_KEY: env.DINGTALK_APP_KEY || '',
+		DINGTALK_APP_SECRET: env.DINGTALK_APP_SECRET || '',
+		CURSOR_MODEL: env.CURSOR_MODEL || 'auto',
+		VOLC_STT_APP_ID: env.VOLC_STT_APP_ID || '',
+		VOLC_STT_ACCESS_TOKEN: env.VOLC_STT_ACCESS_TOKEN || '',
+	};
+}
+
+let config = loadEnv();
+
+// .env 热更新（2秒轮询）
+watchFile(ENV_PATH, { interval: 2000 }, () => {
+	try {
+		const prev = config.CURSOR_API_KEY;
+		const prevModel = config.CURSOR_MODEL;
+		config = loadEnv();
+		if (config.CURSOR_API_KEY !== prev) {
+			const keyPreview = config.CURSOR_API_KEY ? `...${config.CURSOR_API_KEY.slice(-8)}` : '(未设置)';
+			console.log(`[热更新] API Key 已更新 ${keyPreview}`);
+		}
+		if (config.CURSOR_MODEL !== prevModel) {
+			console.log(`[热更新] 模型已切换: ${prevModel} → ${config.CURSOR_MODEL}`);
+		}
+	} catch (err) {
+		console.error('[热更新] 加载失败:', err);
+	}
+});
+
+// ── 项目配置 ─────────────────────────────────────
+interface ProjectsConfig {
+	projects: Record<string, { path: string; description: string }>;
+	default_project: string;
+}
+
+const projectsConfig: ProjectsConfig = existsSync(PROJECTS_PATH)
+	? JSON.parse(readFileSync(PROJECTS_PATH, 'utf-8'))
+	: { projects: { default: { path: ROOT, description: 'Default' } }, default_project: 'default' };
+
+// ── 工作区模板自动初始化 ─────────────────────────
+const TEMPLATE_DIR = resolve(ROOT, 'templates');
+const WORKSPACE_FILES = [
+	".cursor/SOUL.md", ".cursor/USER.md",
+	".cursor/MEMORY.md", ".cursor/HEARTBEAT.md",
+	".cursor/BOOT.md", ".cursor/TOOLS.md",
+];
+const WORKSPACE_RULES = [
+	".cursor/rules/soul.mdc",
+	".cursor/rules/agent-identity.mdc",
+	".cursor/rules/user-context.mdc",
+	".cursor/rules/workspace-rules.mdc",
+	".cursor/rules/tools.mdc",
+	".cursor/rules/memory-protocol.mdc",
+	".cursor/rules/scheduler-protocol.mdc",
+	".cursor/rules/heartbeat-protocol.mdc",
+	".cursor/rules/cursor-capabilities.mdc",
+];
+
+function ensureWorkspace(wsPath: string): boolean {
+	const normalizedWs = resolve(wsPath);
+	const normalizedRoot = resolve(ROOT);
+	const isOwnProject = normalizedWs === normalizedRoot;
+
+	if (!isOwnProject) {
+		return false;
+	}
+
+	try {
+		mkdirSync(resolve(wsPath, ".cursor/memory"), { recursive: true });
+		mkdirSync(resolve(wsPath, ".cursor/sessions"), { recursive: true });
+		mkdirSync(resolve(wsPath, ".cursor/rules"), { recursive: true });
+
+		const isNewWorkspace = !existsSync(resolve(wsPath, ".cursor/SOUL.md"));
+		let copied = 0;
+
+		const rootFiles = ["AGENTS.md"];
+		const allFiles = isNewWorkspace
+			? [...rootFiles, ...WORKSPACE_FILES, ".cursor/BOOTSTRAP.md", ...WORKSPACE_RULES]
+			: [...rootFiles, ...WORKSPACE_FILES, ...WORKSPACE_RULES];
+
+		for (const f of allFiles) {
+			const target = resolve(wsPath, f);
+			if (!existsSync(target)) {
+				const src = resolve(TEMPLATE_DIR, f);
+				if (existsSync(src)) {
+					writeFileSync(target, readFileSync(src, "utf-8"));
+					console.log(`[工作区] 从模板复制: ${f}`);
+					copied++;
+				}
+			}
+		}
+
+		if (copied > 0) {
+			console.log(`[工作区] ${wsPath} 初始化完成 (${copied} 个文件)`);
+			if (isNewWorkspace) {
+				console.log("[工作区] 首次启动：.cursor/BOOTSTRAP.md 已就绪，首次对话将触发出生仪式");
+			}
+		}
+		return isNewWorkspace;
+	} catch (err) {
+		console.error(`[工作区] 初始化失败: ${err instanceof Error ? err.message : err}`);
+		return false;
+	}
+}
+
+// ── 记忆管理器 ───────────────────────────────────
+const defaultWorkspace = projectsConfig.projects[projectsConfig.default_project]?.path || ROOT;
+
+// 记忆工作区：支持独立配置，避免污染工作项目
+const memoryWorkspaceKey = (projectsConfig as any).memory_workspace || projectsConfig.default_project;
+const memoryWorkspace = projectsConfig.projects[memoryWorkspaceKey]?.path || defaultWorkspace;
+
+// 初始化记忆工作区（在记忆管理器前调用）
+ensureWorkspace(memoryWorkspace);
+
+let memory: MemoryManager | undefined;
+try {
+	memory = new MemoryManager({
+		workspaceDir: memoryWorkspace,
+		embeddingApiKey: config.VOLC_EMBEDDING_API_KEY,
+		embeddingModel: config.VOLC_EMBEDDING_MODEL,
+		embeddingEndpoint: "https://ark.cn-beijing.volces.com/api/v3/embeddings/multimodal",
+	});
+	setTimeout(() => {
+		memory!.index().then((n) => {
+			if (n > 0) console.log(`[记忆] 启动索引完成: ${n} 块`);
+		}).catch((e) => console.warn(`[记忆] 启动索引失败: ${e}`));
+	}, 3000);
+} catch (e) {
+	console.warn(`[记忆] 初始化失败（功能降级）: ${e}`);
+}
+
+// ── 最近活跃 webhook（用于定时任务/心跳主动推送）─────
+// （钉钉使用 webhook 而非 chatId）
+
+// ── 心跳系统 ──────────────────────────────────────
+const heartbeat = new HeartbeatRunner({
+	config: {
+		enabled: false,  // 默认关闭，用户通过 /心跳 开启
+		everyMs: 30 * 60_000,  // 30 分钟
+		workspaceDir: memoryWorkspace, // 修复：使用 memoryWorkspace 避免污染工作项目
+	},
+	onExecute: async (prompt: string) => {
+		memory?.appendSessionLog(memoryWorkspace, "user", "[心跳检查] " + prompt.slice(0, 200), config.CURSOR_MODEL);
+		const { result, quotaWarning } = await runAgent(memoryWorkspace, prompt);
+		const finalResult = quotaWarning ? `${quotaWarning}\n\n---\n\n${result}` : result;
+		memory?.appendSessionLog(memoryWorkspace, "assistant", finalResult.slice(0, 3000), config.CURSOR_MODEL);
+		return finalResult;
+	},
+	onDelivery: async (content: string) => {
+		const webhook = getWebhook();
+		if (!webhook) {
+			console.warn("[心跳] 无活跃 webhook，跳过发送");
+			return;
+		}
+		await sendMarkdown(webhook, content, '💓 心跳检查');
+	},
+	log: (msg: string) => console.log(`[心跳] ${msg}`),
+});
+
+// ── 钉钉 access_token ────────────────────────────
+let accessToken = '';
+let tokenExpireTime = 0;
+
+async function refreshAccessToken() {
+	try {
+		const response = await axios.post('https://api.dingtalk.com/v1.0/oauth2/accessToken', {
+			appKey: config.DINGTALK_APP_KEY,
+			appSecret: config.DINGTALK_APP_SECRET,
+		});
+		accessToken = response.data.accessToken;
+		tokenExpireTime = Date.now() + response.data.expireIn * 1000;
+		console.log(`[钉钉] access_token 已刷新`);
+	} catch (error) {
+		console.error('[钉钉] 获取 token 失败:', error);
+	}
+}
+
+async function ensureToken() {
+	if (Date.now() >= tokenExpireTime - 60000) {
+		await refreshAccessToken();
+	}
+}
+
+// ── 时间格式化 ───────────────────────────────────
+function formatRelativeTime(ms: number): string {
+	const diff = Date.now() - ms;
+	if (diff < 60_000) return '刚刚';
+	if (diff < 3600_000) return `${Math.floor(diff / 60_000)}分钟前`;
+	if (diff < 86400_000) return `${Math.floor(diff / 3600_000)}小时前`;
+	if (diff < 604800_000) return `${Math.floor(diff / 86400_000)}天前`;
+	return new Date(ms).toLocaleDateString('zh-CN');
+}
+
+// ── 模型列表与匹配 ───────────────────────────────
+const CURSOR_MODELS = [
+	{ id: 'opus-4.6-thinking', label: 'Opus 4.6', desc: '最强深度推理' },
+	{ id: 'opus-4.5-thinking', label: 'Opus 4.5', desc: '强力推理' },
+	{ id: 'gpt-5.3-codex', label: 'GPT-5.3 Codex', desc: 'OpenAI 编码旗舰' },
+	{ id: 'gemini-3.1-pro', label: 'Gemini 3.1 Pro', desc: 'Google 最新旗舰' },
+	{ id: 'gemini-3-pro', label: 'Gemini 3 Pro', desc: 'Google 旗舰' },
+	{ id: 'gemini-3-flash', label: 'Gemini 3 Flash', desc: 'Google 极速' },
+	{ id: 'auto', label: 'Auto', desc: '自动选择最优' },
+];
+
+function fuzzyMatchModel(input: string): { exact?: typeof CURSOR_MODELS[number]; candidates: typeof CURSOR_MODELS } {
+	const q = input.toLowerCase().replace(/[\s_-]+/g, '');
+	
+	// 精确匹配 id
+	const exact = CURSOR_MODELS.find(m => m.id === input.toLowerCase());
+	if (exact) return { exact, candidates: [] };
+	
+	// 编号匹配
+	const num = Number.parseInt(input, 10);
+	if (!Number.isNaN(num) && num >= 1 && num <= CURSOR_MODELS.length) {
+		return { exact: CURSOR_MODELS[num - 1], candidates: [] };
+	}
+	
+	// 模糊：id 或 label 包含输入
+	const candidates = CURSOR_MODELS.filter(m => {
+		const mid = m.id.replace(/[\s_-]+/g, '');
+		const mlab = m.label.toLowerCase().replace(/[\s_-]+/g, '');
+		return mid.includes(q) || mlab.includes(q) || q.includes(mid);
+	});
+	
+	if (candidates.length === 1) return { exact: candidates[0], candidates: [] };
+	return { candidates };
+}
+
+function buildModelListCard(currentModel: string, errorHint?: string): string {
+	const lines: string[] = [];
+	if (errorHint) lines.push(`${errorHint}\n`);
+	for (let i = 0; i < CURSOR_MODELS.length; i++) {
+		const m = CURSOR_MODELS[i];
+		const isCurrent = m.id === currentModel;
+		lines.push(isCurrent
+			? `**${i + 1}. ${m.id}** · ${m.desc} ✅`
+			: `${i + 1}. \`${m.id}\` · ${m.desc}`);
+	}
+	lines.push('');
+	lines.push('> 发送 `/模型 编号` 或 `/模型 名称` 切换');
+	return lines.join('\n');
+}
+
+// ── Webhook 缓存（用于定时任务推送）───────────────
+// 缓存 conversationId -> webhook 映射，定时任务可以主动推送
+const webhookCache = new Map<string, { webhook: string; timestamp: number }>();
+let lastActiveWebhook: string | undefined;  // 最近活跃的 webhook
+
+function cacheWebhook(conversationId: string, webhook: string) {
+	webhookCache.set(conversationId, { webhook, timestamp: Date.now() });
+	lastActiveWebhook = webhook;
+	
+	// 清理超过 24 小时的缓存
+	const now = Date.now();
+	for (const [id, entry] of webhookCache.entries()) {
+		if (now - entry.timestamp > 24 * 60 * 60 * 1000) {
+			webhookCache.delete(id);
+		}
+	}
+}
+
+function getWebhook(conversationId?: string): string | undefined {
+	if (conversationId) {
+		const entry = webhookCache.get(conversationId);
+		return entry?.webhook;
+	}
+	return lastActiveWebhook;  // 返回最近活跃的
+}
+
+// ── 消息发送 ─────────────────────────────────────
+async function sendMarkdown(webhook: string, markdown: string, title?: string, color?: string) {
+	try {
+		console.log(`[发送] webhook=${webhook.slice(0, 50)} length=${markdown.length}`);
+		
+		// 为标题添加 emoji 前缀（模拟飞书卡片的颜色）
+		const colorEmoji: Record<string, string> = {
+			'blue': '🔵',
+			'green': '✅',
+			'red': '❌',
+			'orange': '⚠️',
+			'purple': '💜',
+			'wathet': '🔷',
+			'grey': '⚪',
+		};
+		const emoji = color ? colorEmoji[color] || '📌' : '📌';
+		const formattedTitle = title ? `${emoji} ${title}` : 'Cursor AI';
+		
+		// 为内容添加轻微的分隔线样式
+		const formattedText = markdown.trim();
+		
+		await axios.post(webhook, {
+			msgtype: 'markdown',
+			markdown: {
+				title: formattedTitle,
+				text: formattedText,
+			},
+		});
+		console.log('[发送] 成功');
+	} catch (error) {
+		console.error('[发送失败]', error instanceof Error ? error.message : error);
+		throw error;
+	}
+}
+
+// ── 语音识别 ─────────────────────────────────────
+async function transcribeAudio(audioPath: string): Promise<string | null> {
+	// TODO: 集成火山引擎 STT
+	// 目前只用本地 whisper
+	try {
+		if (!existsSync(WHISPER_MODEL)) {
+			console.warn('[STT] whisper 模型不存在，跳过识别');
+			return null;
+		}
+		const result = execFileSync('whisper-cpp', [
+			'-m', WHISPER_MODEL,
+			'-f', audioPath,
+			'-l', 'zh',
+			'--output-txt'
+		], { encoding: 'utf-8', timeout: 30000 });
+		return (result || '').trim();
+	} catch (error) {
+		console.error('[STT] whisper 识别失败:', error);
+		return null;
+	}
+}
+
+// ── 下载文件 ─────────────────────────────────────
+async function downloadFile(downloadCode: string, ext: string): Promise<string> {
+	try {
+		await ensureToken();
+		const response = await axios.get(
+			`https://api.dingtalk.com/v1.0/robot/messageFiles/download`,
+			{
+				params: { downloadCode },
+				headers: { 'x-acs-dingtalk-access-token': accessToken },
+				responseType: 'arraybuffer',
+				timeout: 30000,
+			}
+		);
+		const filename = `${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`;
+		const filepath = resolve(INBOX_DIR, filename);
+		writeFileSync(filepath, Buffer.from(response.data));
+		console.log(`[下载] 文件已保存: ${filepath}`);
+		return filepath;
+	} catch (error) {
+		console.error('[下载失败]', error);
+		throw new Error(`文件下载失败: ${error instanceof Error ? error.message : '未知错误'}`);
+	}
+}
+
+// ── 会话管理 ─────────────────────────────────────
+interface Session {
+	agentId?: string;
+	workspace: string;
+	currentProject?: string;  // 当前项目（对话式路由持久切换）
+}
+
+const sessions = new Map<string, Session>();
+
+function getSession(conversationId: string, senderId: string, workspace: string): Session {
+	const key = `dingtalk_${conversationId}_${senderId}`;
+	if (!sessions.has(key)) {
+		sessions.set(key, { workspace });
+	}
+	return sessions.get(key)!;
+}
+
+// ── 会话历史管理（用于 /会话 命令）───────────────
+const SESSIONS_PATH = resolve(import.meta.dirname, '.sessions.json');
+const MAX_SESSION_HISTORY = 20;
+
+interface SessionEntry {
+	id: string;
+	createdAt: number;
+	lastActiveAt: number;
+	summary: string;
+}
+
+interface WorkspaceSessions {
+	active: string | null;
+	history: SessionEntry[];
+	currentProject?: string;
+}
+
+const sessionsStore: Map<string, WorkspaceSessions> = new Map();
+
+function loadSessionsFromDisk(): void {
+	try {
+		if (!existsSync(SESSIONS_PATH)) return;
+		const raw = JSON.parse(readFileSync(SESSIONS_PATH, 'utf-8'));
+		sessionsStore.clear();
+		for (const [k, v] of Object.entries(raw)) {
+			if (typeof v === 'string') {
+				sessionsStore.set(k, {
+					active: v,
+					history: [{ id: v, createdAt: Date.now(), lastActiveAt: Date.now(), summary: '(旧会话)' }],
+				});
+			} else {
+				sessionsStore.set(k, v as WorkspaceSessions);
+			}
+		}
+		console.log(`[Session] 从磁盘恢复 ${sessionsStore.size} 个工作区会话`);
+	} catch {}
+}
+
+let sessionsSaving = false;
+
+function saveSessions(): void {
+	try {
+		sessionsSaving = true;
+		writeFileSync(SESSIONS_PATH, JSON.stringify(Object.fromEntries(sessionsStore), null, 2));
+	} catch {} finally {
+		setTimeout(() => { sessionsSaving = false; }, 500);
+	}
+}
+
+loadSessionsFromDisk();
+
+function getActiveSessionId(workspace: string): string | undefined {
+	return sessionsStore.get(workspace)?.active || undefined;
+}
+
+function setActiveSession(workspace: string, sessionId: string, summary?: string): void {
+	let ws = sessionsStore.get(workspace);
+	if (!ws) {
+		ws = { active: null, history: [] };
+		sessionsStore.set(workspace, ws);
+	}
+	
+	const existing = ws.history.find(h => h.id === sessionId);
+	if (existing) {
+		existing.lastActiveAt = Date.now();
+		if (summary && existing.summary === '(新会话)') {
+			existing.summary = summary;
+		}
+	} else {
+		ws.history.unshift({
+			id: sessionId,
+			createdAt: Date.now(),
+			lastActiveAt: Date.now(),
+			summary: summary || '(新会话)',
+		});
+	}
+	
+	if (ws.history.length > MAX_SESSION_HISTORY) {
+		ws.history = ws.history.slice(0, MAX_SESSION_HISTORY);
+	}
+	
+	ws.active = sessionId;
+	saveSessions();
+}
+
+function archiveAndResetSession(workspace: string): void {
+	const ws = sessionsStore.get(workspace);
+	if (ws?.active) {
+		ws.active = null;
+		saveSessions();
+		console.log(`[Session ${workspace}] 已归档并重置`);
+	}
+}
+
+function switchToSession(workspace: string, sessionId: string): boolean {
+	const ws = sessionsStore.get(workspace);
+	if (!ws) return false;
+	const entry = ws.history.find(h => h.id === sessionId);
+	if (!entry) return false;
+	ws.active = sessionId;
+	entry.lastActiveAt = Date.now();
+	saveSessions();
+	return true;
+}
+
+function getSessionHistory(workspace: string, limit = 10): SessionEntry[] {
+	const ws = sessionsStore.get(workspace);
+	if (!ws) return [];
+	return [...ws.history]
+		.sort((a, b) => b.lastActiveAt - a.lastActiveAt)
+		.slice(0, limit);
+}
+
+// ── 并发控制 ─────────────────────────────────────
+function getLockKey(workspace: string): string {
+	const sid = getActiveSessionId(workspace);
+	return sid ? `session:${sid}` : `ws:${workspace}`;
+}
+
+// 同一 session 的消息串行执行；不同 session（即使同工作区）可并行
+const sessionLocks = new Map<string, Promise<void>>();
+async function withSessionLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
+	const prev = sessionLocks.get(lockKey) || Promise.resolve();
+	let release!: () => void;
+	const next = new Promise<void>((r) => { release = r; });
+	sessionLocks.set(lockKey, next);
+	await prev;
+	try {
+		return await fn();
+	} finally {
+		release();
+	}
+}
+
+// 同会话串行执行，不同会话可并行
+const busySessions = new Set<string>();
+
+// 追踪运行中的 agent 进程（用于 /终止）
+const activeAgents = new Map<string, { pid: number; kill: () => void }>();
+const childPids: number[] = [];
+
+process.on('SIGTERM', () => {
+	for (const pid of childPids) {
+		try { process.kill(pid, 'SIGTERM'); } catch {}
+	}
+	process.exit(0);
+});
+
+// ── 工具调用描述辅助函数 ──────────────────────────
+const TOOL_LABELS: Record<string, string> = {
+	read: "📖 读取", write: "✏️ 写入", strReplace: "✏️ 编辑",
+	shell: "⚡ 执行", grep: "🔍 搜索", glob: "📂 查找",
+	semanticSearch: "🔎 语义搜索", webSearch: "🌐 搜索网页", webFetch: "🌐 抓取网页",
+	delete: "🗑️ 删除", editNotebook: "📓 编辑笔记本",
+	callMcpTool: "🔌 MCP工具", task: "🤖 子任务",
+};
+
+function basename(p: string): string {
+	const parts = p.split("/");
+	return parts[parts.length - 1] || p;
+}
+
+function describeToolCall(tc: Record<string, { args?: Record<string, unknown> }>): string {
+	for (const [key, val] of Object.entries(tc)) {
+		const name = key.replace(/ToolCall$/, "");
+		const label = TOOL_LABELS[name] || `🔧 ${name}`;
+		const a = val?.args;
+		if (!a) return label;
+		if (a.path) return `${label} ${basename(String(a.path))}`;
+		if (a.command) return `${label} ${String(a.command).slice(0, 80)}`;
+		if (a.pattern) return `${label} "${a.pattern}"${a.path ? ` in ${basename(String(a.path))}` : ""}`;
+		if (a.glob_pattern) return `${label} ${a.glob_pattern}`;
+		if (a.query) return `${label} ${String(a.query).slice(0, 60)}`;
+		if (a.search_term) return `${label} ${String(a.search_term).slice(0, 60)}`;
+		if (a.url) return `${label} ${String(a.url).slice(0, 60)}`;
+		if (a.description) return `${label} ${String(a.description).slice(0, 60)}`;
+		return label;
+	}
+	return "🔧 工具调用";
+}
+
+function describeToolResult(tc: Record<string, { args?: Record<string, unknown>; result?: Record<string, { content?: string }> }>): string {
+	for (const val of Object.values(tc)) {
+		const r = val?.result;
+		if (!r) return "";
+		const success = r.success as Record<string, unknown> | undefined;
+		if (success?.content) return String(success.content).slice(0, 200);
+		const err = r.error as Record<string, unknown> | undefined;
+		if (err?.message) return `❌ ${String(err.message).slice(0, 150)}`;
+	}
+	return "";
+}
+
+function buildToolSummary(tools: string[]): string {
+	if (tools.length === 0) return "";
+	
+	// 按工具类型分组，保留所有详细信息
+	const groups = new Map<string, { emoji: string; items: string[] }>();
+	
+	for (const tool of tools) {
+		const match = tool.match(/^([🔧📖✏️⚡🔍📂🔎🌐🗑️📓🔌🤖]+)\s+(.+)/);
+		if (!match) continue;
+		
+		const emoji = match[1];
+		const detail = match[2];
+		
+		if (!groups.has(emoji)) {
+			groups.set(emoji, { emoji, items: [] });
+		}
+		groups.get(emoji)!.items.push(detail);
+	}
+	
+	// 生成详细列表
+	const lines: string[] = ['📋 **本次操作：**'];
+	for (const { emoji, items } of groups.values()) {
+		const label = Object.values(TOOL_LABELS).find(l => l.startsWith(emoji))?.replace(/^.+?\s/, '') || '操作';
+		lines.push(`${emoji} **${label}** (${items.length}个)：`);
+		for (const item of items) {
+			lines.push(`  · ${item}`);
+		}
+	}
+	
+	return lines.join('\n');
+}
+
+// ── Cursor Agent 调用（基于飞书的稳定实现）────────
+interface RunAgentResult {
+	result: string;
+	quotaWarning?: string;
+}
+
+async function runAgent(
+	workspace: string,
+	message: string,
+	agentId?: string,
+	context?: {
+		platform?: string;
+		webhook?: string;
+		/** 成功完成时回调，用于更新 session.agentId 以便后续 --resume */
+		onSessionId?: (sessionId: string) => void;
+	}
+): Promise<RunAgentResult> {
+	const primaryModel = config.CURSOR_MODEL || 'opus-4.6-thinking';
+
+	// 安全调用 session ID 回调，失败时不中断主流程
+	const notifySession = (out: { sessionId?: string }) => {
+		if (out.sessionId && context?.onSessionId) {
+			try {
+				context.onSessionId(out.sessionId);
+			} catch (err) {
+				console.error('[onSessionId 回调失败]', err);
+			}
+		}
+	};
+
+	async function runWithModel(model: string): Promise<{ result: string; sessionId?: string }> {
+		return new Promise((res, reject) => {
+			const args = [
+				'-p', '--force', '--trust', '--approve-mcps',
+				'--workspace', workspace,
+				'--model', model,
+				'--output-format', 'stream-json',
+				'--stream-partial-output',
+			];
+			if (agentId) args.push('--resume', agentId);
+			args.push('--', message);
+
+			const env = config.CURSOR_API_KEY
+				? { ...process.env, CURSOR_API_KEY: config.CURSOR_API_KEY }
+				: process.env;
+			if (context?.platform) env.CURSOR_PLATFORM = context.platform;
+			if (context?.webhook) env.CURSOR_WEBHOOK = context.webhook;
+			env.CURSOR_CRON_FILE = resolve(ROOT, 'cron-jobs-dingtalk.json');
+
+			console.log(`[CLI] 启动 agent 进程，model=${model}, resume=${!!agentId}`);
+			const proc = spawn('agent', args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
+
+			const lockKey = getLockKey(workspace);
+			if (proc.pid) {
+				childPids.push(proc.pid);
+				activeAgents.set(lockKey, { pid: proc.pid, kill: () => proc.kill('SIGTERM') });
+			}
+
+			let stderr = '';
+			let resultText = '';
+			let sessionId: string | undefined = agentId;
+			let assistantBuf = '';
+			let lastSegment = '';
+			let toolSummary: string[] = [];
+			let lineBuf = '';
+			let done = false;
+
+			function cleanup() {
+				done = true;
+				activeAgents.delete(lockKey);
+				if (proc.pid) {
+					const idx = childPids.indexOf(proc.pid);
+					if (idx >= 0) childPids.splice(idx, 1);
+				}
+			}
+
+			proc.stdout.on('data', (chunk) => {
+				lineBuf += chunk.toString();
+				const lines = lineBuf.split('\n');
+				lineBuf = lines.pop() || '';
+				for (const line of lines) {
+					if (!line.trim()) continue;
+					try {
+						const ev = JSON.parse(line);
+						if (ev.session_id && !sessionId) {
+							sessionId = ev.session_id;
+						}
+
+						if (ev.type === 'result' && ev.result != null) {
+							resultText = ev.result;
+						}
+						if (ev.type === 'assistant' && ev.message?.content) {
+							for (const c of ev.message.content) {
+								if (c.type === 'text' && c.text) {
+									assistantBuf += c.text;
+									lastSegment += c.text;
+								}
+							}
+						}
+						if (ev.type === 'tool_call' && ev.tool_call) {
+							if (ev.subtype === 'started') {
+								const desc = describeToolCall(ev.tool_call);
+								toolSummary.push(desc);
+							}
+						}
+					} catch (_) {}
+				}
+			});
+
+			proc.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+
+			proc.on('close', (code) => {
+				if (done) return;
+				cleanup();
+				
+				if (lineBuf.trim()) {
+					try {
+						const ev = JSON.parse(lineBuf);
+						if (ev.session_id && !sessionId) sessionId = ev.session_id;
+						if (ev.type === 'result' && ev.result != null) resultText = ev.result;
+					} catch (_) {}
+				}
+
+				const rawResultText = typeof resultText === 'string' ? resultText.trim() : '';
+				const finalSegment = lastSegment.trim();
+				const rawOutput = rawResultText || finalSegment || assistantBuf.trim() || stderr.trim() || '(无输出)';
+
+				// 构建工具调用摘要（添加到回复开头）
+				let finalOutput = rawOutput;
+				if (toolSummary.length > 0) {
+					const summary = buildToolSummary(toolSummary);
+					if (summary) {
+						finalOutput = summary + '\n\n---\n\n' + rawOutput;
+					}
+				}
+
+				console.log(`[runAgent完成] rawResultText.length=${rawResultText.length} finalSegment.length=${finalSegment.length} assistantBuf.length=${assistantBuf.trim().length} tools=${toolSummary.length}`);
+
+				if (code === 0) res({ result: finalOutput, sessionId });
+				else reject(new Error(`Agent exited with code ${code}\n${stderr}`));
+			});
+
+			proc.on('error', (err) => {
+				if (!done) { cleanup(); reject(err); }
+			});
+		});
+	}
+
+	try {
+		const out = await runWithModel(primaryModel);
+		notifySession(out);
+		return { result: out.result };
+	} catch (error) {
+		if (isQuotaError(error as Error)) {
+			console.log(`[降级] ${primaryModel} 余额不足，切换到 auto`);
+			try {
+				const out = await runWithModel('auto');
+				notifySession(out);
+				return {
+					result: out.result,
+					quotaWarning: `⚠️ **模型降级**\n\n${primaryModel} 余额不足，已用 auto 完成。`,
+				};
+			} catch (retryError) {
+				throw new Error(
+					`原模型余额不足且降级失败: ${retryError instanceof Error ? retryError.message : String(retryError)}`
+				);
+			}
+		}
+		throw error;
+	}
+}
+
+// ── 对话式路由识别 ───────────────────────────────
+interface RouteIntent {
+	type: 'switch' | 'temp' | 'none';  // switch=持久切换, temp=临时路由, none=无路由
+	project?: string;  // 项目名
+	path?: string;  // 任意路径（用于临时切换）
+	cleanedText: string;  // 移除路由信息后的文本
+}
+
+/**
+ * 识别对话式路由意图
+ * 支持：
+ * - "切换到 activity 项目" / "现在用 api" → 持久切换
+ * - "帮我看看 activity 项目的代码" / "在 api 里查个 bug" → 临时路由
+ * - "#activity 消息" / "@api 消息" → 临时路由（简化符号）
+ * - "切换到 /path/to/project" → 临时切换到任意路径
+ * - "#/path/to/project 消息" → 快捷路径语法
+ */
+function detectRouteIntent(text: string): RouteIntent {
+	const raw = (text || '').trim().replace(/\s+/g, ' ');
+	const { projects } = projectsConfig;
+	const projectNames = Object.keys(projects);
+	const projectPattern = projectNames.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+	
+	// 0. 路径快捷语法：#/path 或 @/path
+	const pathSymbolMatch = raw.match(/^[#@]((?:~?\/|~).+?)\s+(.+)$/);
+	if (pathSymbolMatch) {
+		const rawPath = pathSymbolMatch[1];
+		const absolutePath = rawPath.startsWith('~') 
+			? rawPath.replace(/^~/, process.env.HOME || '~')
+			: rawPath;
+		return {
+			type: 'temp',
+			path: absolutePath,
+			cleanedText: pathSymbolMatch[2].trim(),
+		};
+	}
+	
+	// 1. 简化符号：#项目名 或 @项目名
+	const symbolMatch = raw.match(new RegExp(`^[#@](${projectPattern})\\s+(.+)`, 'i'));
+	if (symbolMatch) {
+		const project = symbolMatch[1].toLowerCase();
+		if (projects[project]) {
+			return {
+				type: 'temp',
+				project,
+				cleanedText: symbolMatch[2].trim(),
+			};
+		}
+	}
+	
+	// 2a. 切换到任意路径（必须以 / 或 ~ 开头，避免误匹配 "切换到 remote"）
+	const pathSwitchMatch = raw.match(/^(?:切换到|切到|切换|进入|打开)(?:路径)?\s+([~\/].+?)\s*$/i);
+	if (pathSwitchMatch) {
+		const absolutePath = pathSwitchMatch[1].startsWith('~')
+			? pathSwitchMatch[1].replace(/^~/, process.env.HOME || '~')
+			: pathSwitchMatch[1];
+		return {
+			type: 'switch',
+			path: absolutePath,
+			cleanedText: '',
+		};
+	}
+	
+	// 2b. 持久切换到项目："切换到 XXX" / "切到 XXX" / "现在用 XXX" / "改成 XXX 项目"
+	const switchPatterns = [
+		new RegExp(`^(?:切换到|切到|切换|现在用|改成|使用)\\s*(${projectPattern})(?:\\s*项目)?\\s*$`, 'i'),
+		new RegExp(`^(?:进入|打开)\\s*(${projectPattern})(?:\\s*项目)?\\s*$`, 'i'),
+	];
+	for (const pattern of switchPatterns) {
+		const match = raw.match(pattern);
+		if (match) {
+			const project = match[1].toLowerCase();
+			if (projects[project]) {
+				return { type: 'switch', project, cleanedText: '' };
+			}
+		}
+	}
+	
+	// 3. 临时路由："帮我看看 XXX 项目" / "在 XXX 里查" / "XXX 项目有个 bug"
+	const tempPatterns = [
+		new RegExp(`(?:看看|查查|分析|检查)\\s*(${projectPattern})(?:项目)?(?:的|里|中)?`, 'i'),
+		new RegExp(`在\\s*(${projectPattern})(?:项目)?(?:里|中)`, 'i'),
+		new RegExp(`(${projectPattern})(?:项目)?(?:有|出现|发现)`, 'i'),
+	];
+	for (const pattern of tempPatterns) {
+		const match = raw.match(pattern);
+		if (match) {
+			const project = match[1].toLowerCase();
+			if (projects[project]) {
+				// 不移除项目名，保留完整语境
+				return { type: 'temp', project, cleanedText: text };
+			}
+		}
+	}
+	
+	return { type: 'none', cleanedText: text };
+}
+
+// ── 项目路由 ─────────────────────────────────────
+function resolveWorkspace(
+	text: string,
+	currentProject?: string,
+	intent?: RouteIntent
+): { workspace: string; message: string; label: string; routeChanged?: boolean; intent: RouteIntent } {
+	const { projects, default_project } = projectsConfig;
+	
+	// 1. 传统路由：/项目名 消息
+	const slashMatch = text.match(/^\/(\w+)\s+(.+)$/s);
+	if (slashMatch && projects[slashMatch[1].toLowerCase()]) {
+		return {
+			workspace: projects[slashMatch[1].toLowerCase()].path,
+			message: slashMatch[2].trim(),
+			label: slashMatch[1].toLowerCase(),
+			routeChanged: true,
+			intent: intent || { type: 'none', cleanedText: slashMatch[2].trim() },
+		};
+	}
+	
+	// 2. 对话式路由（使用传入的 intent，避免重复检测）
+	const routeIntent = intent || detectRouteIntent(text);
+	
+	// 2a. 路径型路由（临时切换到任意目录）
+	if (routeIntent.type !== 'none' && routeIntent.path) {
+		const pathLabel = routeIntent.path.split('/').pop() || routeIntent.path;
+		return {
+			workspace: routeIntent.path,
+			message: routeIntent.cleanedText || text,
+			label: `📁${pathLabel}`,
+			routeChanged: routeIntent.type === 'switch',
+			intent: routeIntent,
+		};
+	}
+	
+	// 2b. 项目名路由
+	if (routeIntent.type !== 'none' && routeIntent.project) {
+		return {
+			workspace: projects[routeIntent.project].path,
+			message: routeIntent.cleanedText || text,
+			label: routeIntent.project,
+			routeChanged: routeIntent.type === 'switch',
+			intent: routeIntent,
+		};
+	}
+	
+	// 3. 使用当前项目（如果有）
+	if (currentProject && projects[currentProject]) {
+		return {
+			workspace: projects[currentProject].path,
+			message: text.trim(),
+			label: currentProject,
+			intent: routeIntent,
+		};
+	}
+	
+	// 4. 默认项目
+	const defaultProj = projects[default_project];
+	return {
+		workspace: defaultProj?.path || ROOT,
+		message: text.trim(),
+		label: default_project,
+		intent: routeIntent,
+	};
+}
+
+// ── 定时任务文件位置修正 ─────────────────────────
+async function fixCronJobsLocation(workspace: string, webhook: string) {
+	// 检查工作区是否有 cron-jobs.json（错误位置）
+	const wrongPath = resolve(workspace, 'cron-jobs.json');
+	const correctPath = resolve(ROOT, 'cron-jobs-dingtalk.json');
+	
+	if (!existsSync(wrongPath)) return;
+	
+	try {
+		console.log(`[修正] 发现错误位置的任务文件: ${wrongPath}`);
+		
+		// 读取错误位置的任务
+		const wrongData = JSON.parse(readFileSync(wrongPath, 'utf-8'));
+		
+		// 读取正确位置的现有任务（如果存在）
+		let correctData: any;
+		try {
+			correctData = JSON.parse(readFileSync(correctPath, 'utf-8'));
+		} catch {
+			correctData = { version: 1, jobs: [] };
+		}
+		
+	// 修正每个任务的字段
+	let fixedCount = 0;
+	for (const job of wrongData.jobs || []) {
+		// 跳过明确属于其他平台的任务
+		if (job.platform && job.platform !== 'dingtalk') {
+			console.log(`[修正] 跳过 ${job.platform} 平台的任务: ${job.name}`);
+			continue;
+		}
+		
+		// 添加缺失的 platform 和 webhook 字段
+		if (!job.platform) {
+			job.platform = 'dingtalk';
+			fixedCount++;
+		}
+		if (!job.webhook) {
+			job.webhook = webhook;
+			fixedCount++;
+		}
+		
+		// 检查是否已存在（避免重复）
+		const exists = correctData.jobs.some((j: any) => j.id === job.id);
+		if (!exists) {
+			correctData.jobs.push(job);
+		}
+	}
+		
+		// 保存到正确位置
+		writeFileSync(correctPath, JSON.stringify(correctData, null, 2));
+		console.log(`[修正] ✅ 已移动 ${wrongData.jobs?.length || 0} 个任务到 ${correctPath}`);
+		console.log(`[修正] ✅ 修复了 ${fixedCount} 个缺失字段`);
+		
+		// 删除错误位置的文件
+		unlinkSync(wrongPath);
+		console.log(`[修正] ✅ 已删除 ${wrongPath}`);
+		
+	} catch (err) {
+		console.error('[修正] 失败:', err);
+	}
+}
+
+// ── 消息去重（使用 Map 存储时间戳）─────────────
+const seenMessages = new Map<string, number>();
+const MAX_SEEN_SIZE = 1000;
+
+function isDuplicate(messageId: string): boolean {
+	const now = Date.now();
+
+	// 清理超过 5 分钟的旧消息
+	for (const [id, timestamp] of seenMessages.entries()) {
+		if (now - timestamp > 5 * 60 * 1000) {
+			seenMessages.delete(id);
+		}
+	}
+
+	// 检查是否重复
+	if (seenMessages.has(messageId)) {
+		const age = now - seenMessages.get(messageId)!;
+		console.log(`[去重] ❌ 重复消息 msgId="${messageId}" (${Math.round(age/1000)}秒前已处理)`);
+		return true;
+	}
+
+	// 记录新消息
+	seenMessages.set(messageId, now);
+	console.log(`[去重] ✅ 新消息 msgId="${messageId}" (缓存: ${seenMessages.size})`);
+
+	// 防止内存泄漏：超过上限时删除最旧的
+	if (seenMessages.size > MAX_SEEN_SIZE) {
+		const oldest = Array.from(seenMessages.entries()).sort((a, b) => a[1] - b[1])[0];
+		seenMessages.delete(oldest[0]);
+	}
+
+	return false;
+}
+
+// ── 消息处理 ─────────────────────────────────────
+async function handleMessage(msg: any) {
+	const data = JSON.parse(msg.data);
+	
+	// 钉钉的 messageId 在 data 中，不是 headers 中
+	const messageId = data.msgId || data.messageId || 'unknown';
+	
+	if (isDuplicate(messageId)) {
+		console.log(`[去重] ⏭️  跳过重复消息`);
+		return;
+	}
+	
+	// 数据完整性检查
+	if (!data || typeof data !== 'object') {
+		console.error('[消息] 数据格式错误:', data);
+		return;
+	}
+	
+	const conversationId = data.conversationId;
+	const senderId = data.senderStaffId || data.senderId;
+	const sessionWebhook = data.sessionWebhook;
+	const msgtype = data.msgtype;
+	
+	if (!conversationId || !senderId || !sessionWebhook || !msgtype) {
+		console.error('[消息] 缺少必要字段:', { conversationId, senderId, sessionWebhook, msgtype });
+		return;
+	}
+	
+	const chatType = data.conversationType === '1' ? 'private' : 'group';  // 1=单聊, 2=群聊
+	const isGroup = chatType === 'group';
+	
+	// 缓存 webhook（用于定时任务推送）
+	cacheWebhook(conversationId, sessionWebhook);
+	
+	console.log(`[收到消息] msgId=${messageId.slice(0, 20)} type=${msgtype} chatType=${chatType} conversation=${conversationId.slice(0, 20)} sender=${senderId} webhook=${sessionWebhook.slice(0, 50)}`);
+	
+	try {
+		// 解析消息内容
+		let text = '';
+		let needsProcessing = false;
+		
+		switch (msgtype) {
+			case 'text':
+				text = data.text?.content || '';
+				break;
+				
+		case 'picture':
+			await sendMarkdown(sessionWebhook, '📷 正在处理图片...', '处理中', 'wathet');
+			try {
+				if (!data.content?.downloadCode) {
+					throw new Error('图片下载码缺失');
+				}
+				const imagePath = await downloadFile(data.content.downloadCode, '.jpg');
+				const instruction = "\n\n**注意**：这张图片来自钉钉消息系统的临时存储，请直接用 Read 工具读取分析，不要复制到当前工作区。";
+				text = `用户发了一张图片：${imagePath}${instruction}\n\n请查看并回复。`;
+			} catch (error) {
+				await sendMarkdown(sessionWebhook, `❌ 图片下载失败: ${error instanceof Error ? error.message : '未知错误'}`, '失败', 'red');
+				return;
+			}
+			break;
+				
+		case 'audio':
+			await sendMarkdown(sessionWebhook, '🎙️ 正在识别语音...', '识别中', 'wathet');
+			try {
+				if (!data.content?.downloadCode) {
+					throw new Error('语音下载码缺失');
+				}
+				const audioPath = await downloadFile(data.content.downloadCode, '.amr');
+				const transcript = await transcribeAudio(audioPath);
+				try { unlinkSync(audioPath); } catch {}  // 清理临时文件
+				if (transcript) {
+					text = transcript;
+					console.log(`[语音] 识别成功: ${transcript.slice(0, 60)}`);
+				} else {
+					await sendMarkdown(sessionWebhook, '❌ 语音识别失败，请用文字重新发送', '识别失败', 'red');
+					return;
+				}
+			} catch (error) {
+				await sendMarkdown(sessionWebhook, `❌ 语音处理失败: ${error instanceof Error ? error.message : '未知错误'}`, '失败', 'red');
+				return;
+			}
+			break;
+				
+		case 'file':
+			const fileName = data.content?.fileName || '未命名文件';
+			try {
+				if (!data.content?.downloadCode) {
+					throw new Error('文件下载码缺失');
+				}
+				const filePath = await downloadFile(data.content.downloadCode, '');
+				text = `用户发了文件 ${fileName}，已保存到 ${filePath}`;
+			} catch (error) {
+				await sendMarkdown(sessionWebhook, `❌ 文件下载失败: ${error instanceof Error ? error.message : '未知错误'}`, '失败', 'red');
+				return;
+			}
+			break;
+				
+			default:
+				await sendMarkdown(sessionWebhook, `暂不支持消息类型: ${msgtype}`, '不支持', 'grey');
+				return;
+		}
+		
+		if (!text.trim()) {
+			console.warn('[处理] 消息内容为空');
+			return;
+		}
+		
+		// 先获取会话，读取当前项目
+		const defaultWorkspace = projectsConfig.projects[projectsConfig.default_project]?.path || ROOT;
+		const session = getSession(conversationId, senderId, defaultWorkspace);
+		const currentProject = session.currentProject;
+		
+		// /项目、/project → 列出所有项目
+		if (/^\/(项目|project|xm|proj)\s*$/i.test(text.trim())) {
+			const current = session.currentProject || projectsConfig.default_project;
+			
+			const lines = [
+				`**当前项目：${current}** ✨`,
+				"",
+				"**所有项目（长按复制项目名）：**",
+				...Object.entries(projectsConfig.projects).map(([name, info]) => {
+					const mark = name === current ? " ← 当前" : "";
+					return `**${info.description}${mark}**\n项目名（复制）：\n\`\`\`\n${name}\n\`\`\`\n路径：\`${info.path}\``;
+				}),
+				"",
+				`**切换方式：** 说「切换到 ${Object.keys(projectsConfig.projects)[1] || 'xxx'}」或「${Object.keys(projectsConfig.projects)[1] || 'xxx'}项目帮我xxx」`,
+			];
+			await sendMarkdown(sessionWebhook, lines.join("\n"), '📂 项目列表', 'blue');
+			return;
+		}
+		
+		// 对话式路由识别（只调用一次）
+		const routeIntent = detectRouteIntent(text);
+		
+		// 持久切换到任意路径：提示用户这是临时切换
+		if (routeIntent.type === 'switch' && routeIntent.path) {
+			const pathLabel = routeIntent.path.split('/').pop() || routeIntent.path;
+			const msg = `**📂 临时切换到路径：${pathLabel}**\n\n📁 \`${routeIntent.path}\`\n\n⚠️ 此为临时路径，不会保存到持久配置。\n若要固定使用，请添加到 \`projects.json\`。\n\n下一条消息将在此路径执行。`;
+			await sendMarkdown(sessionWebhook, msg, '📂 临时切换', 'blue');
+			console.log(`[路由] 临时切换到路径: ${routeIntent.path}`);
+			return;
+		}
+		
+		// 持久切换到项目：直接切换项目并确认
+		if (routeIntent.type === 'switch' && routeIntent.project) {
+			const projectInfo = projectsConfig.projects[routeIntent.project];
+			if (projectInfo) {
+				// 更新当前项目
+				session.currentProject = routeIntent.project;
+
+				const msg = `**✅ 已切换到项目：${routeIntent.project}**\n\n📁 ${projectInfo.description}\n\n路径（长按复制）：\n\`\`\`\n${projectInfo.path}\n\`\`\`\n\n后续消息将在此项目中执行，直到你切换到其他项目。`;
+				await sendMarkdown(sessionWebhook, msg, '✅ 项目已切换', 'green');
+				console.log(`[路由] 持久切换到项目: ${routeIntent.project}`);
+				return;
+			}
+			// 识别到切换意图但项目不存在，明确提示
+			const names = Object.keys(projectsConfig.projects);
+			await sendMarkdown(sessionWebhook, `未找到项目「${routeIntent.project}」。\n\n可用项目（长按复制）：\n\`\`\`\n${names.join('\n')}\n\`\`\`\n\n请检查 \`projects.json\` 或使用上述项目名。`, '未找到项目', 'orange');
+			return;
+		}
+
+		// 检测相对时间新闻推送（X分钟后推送热点、X小时后推送新闻）
+		const relativeNewsMatch = text.match(/(\d+)\s*(分钟|小时)(?:[后以]后|后)\s*(?:推送|发送)?\s*(?:前|top)?\s*(\d+)?\s*条?\s*(?:今日)?\s*(热点|新闻|热榜)/i);
+		if (relativeNewsMatch) {
+			const [, numStr, unit, topNStr, _] = relativeNewsMatch;
+			const num = parseInt(numStr, 10);
+			const topN = topNStr ? Math.min(50, Math.max(1, parseInt(topNStr, 10))) : 15;
+			const minutes = unit === '小时' ? num * 60 : num;
+			const runAtMs = Date.now() + minutes * 60 * 1000;
+			const runAt = new Date(runAtMs);
+			const timeDesc = `${num}${unit}后（${runAt.toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Shanghai' })}）`;
+			
+			const msg = JSON.stringify({ type: 'fetch-news', options: { topN } });
+			await scheduler.add({
+				name: '热点新闻推送',
+				enabled: true,
+				deleteAfterRun: true, // 相对时间任务执行一次后删除
+				schedule: { kind: 'at', at: runAt.toISOString() },
+				message: msg,
+				platform: 'dingtalk',
+				webhook: sessionWebhook,
+			});
+			await sendMarkdown(
+				sessionWebhook,
+				`✅ 已创建定时任务\n\n⏰ 执行时间：${timeDesc}\n📰 推送内容：今日热点新闻（前 ${topN} 条）\n📱 到时会通过**钉钉**提醒你\n\n发送 \`/任务\` 可查看所有任务`,
+				'⏰ 定时任务已创建',
+				'green'
+			);
+			return;
+		}
+
+		// 检测新闻推送定时请求（每天/每日 早上/上午 9点 推送热点、明天上午10点推送新闻）
+		const newsScheduleMatch = text.match(/(每天|每日|明天)\s*(早上|上午|下午)?\s*([0-9一二三四五六七八九十]+)\s*[点时]?\s*(?:给我)?\s*(?:推送|发送)?\s*(?:下|今日)?\s*(热点|新闻|热榜)/i);
+		if (newsScheduleMatch) {
+			const [, when, ap, hourStr] = newsScheduleMatch;
+			const numMap: Record<string, number> = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
+			const toNum = (s: string) => (numMap[s] ?? parseInt(s, 10)) || 9;
+			let topN = 15;
+			const topMatch = text.match(/(?:推送|前)\s*(\d+)\s*条/i);
+			if (topMatch) topN = Math.min(50, Math.max(1, parseInt(topMatch[1], 10)));
+			let schedule: { kind: 'cron'; expr: string; tz?: string } | { kind: 'at'; at: string };
+			let timeDesc: string;
+			if (when === '每天' || when === '每日') {
+				const hour = toNum(hourStr);
+				const hour24 = ap === '下午' ? (hour % 12) + 12 : hour;
+				schedule = { kind: 'cron', expr: `0 ${hour24} * * *`, tz: 'Asia/Shanghai' };
+				timeDesc = `每天 ${hour24}:00`;
+			} else {
+				let hour = toNum(hourStr);
+				if (ap === '下午') hour = (hour % 12) + 12;
+				const d = new Date();
+				d.setDate(d.getDate() + 1);
+				d.setHours(hour, 0, 0, 0);
+				schedule = { kind: 'at', at: d.toISOString() };
+				timeDesc = `明天 ${hour}:00`;
+			}
+			const message = JSON.stringify({ type: 'fetch-news', options: { topN } });
+			await scheduler.add({
+				name: '热点新闻推送',
+				enabled: true,
+				deleteAfterRun: false,
+				schedule,
+				message,
+				platform: 'dingtalk',
+				webhook: sessionWebhook,
+			});
+			await sendMarkdown(
+				sessionWebhook,
+				`✅ 已创建定时任务\n\n⏰ 执行时间：${timeDesc}\n📰 推送内容：今日热点新闻（前 ${topN} 条）\n📱 到时会通过**钉钉**提醒你\n\n发送 \`/任务\` 可查看所有任务`,
+				'⏰ 定时任务已创建',
+				'green'
+			);
+			return;
+		}
+		
+		// 检测「每个工作日 HH点/HH:MM/HH点MM/HH点 MM分 提醒」请求，服务器端直接创建
+		const weekdayScheduleMatch = text.match(/每个工作日\s*(\d{1,2})(?:[.:：](\d{1,2})|点\s*(\d{1,2})\s*分?|点)?\s*(?:提醒|通知)?(?:我)?\s*(.+)$/i);
+		if (weekdayScheduleMatch) {
+			const [, hourStr, minStr1, minStr2, taskMessage] = weekdayScheduleMatch;
+			const hour = Math.min(23, Math.max(0, parseInt(hourStr!, 10) || 14));
+			// 分钟可能来自 `:45` (minStr1) 或 `点45` (minStr2)
+			const minStr = minStr1 || minStr2;
+			const minute = minStr != null && minStr !== '' ? Math.min(59, Math.max(0, parseInt(minStr, 10) || 0)) : 0;
+			const task = await scheduler.add({
+				name: '工作日提醒',
+				enabled: true,
+				deleteAfterRun: false,
+				schedule: { kind: 'cron', expr: `${minute} ${hour} * * 1-5`, tz: 'Asia/Shanghai' },
+				message: taskMessage!.trim(),
+				platform: 'dingtalk',
+				webhook: sessionWebhook,
+			});
+			const timeDesc = `${hour}:${String(minute).padStart(2, '0')}`;
+			await sendMarkdown(sessionWebhook, `✅ 已设置好，**每个工作日 ${timeDesc}** 通过钉钉提醒你：\n\n${taskMessage!.trim()}\n\n发送 \`/cron\` 可查看所有任务。`, '⏰ 定时任务已创建');
+			console.log(`[任务] 服务器端创建: 每个工作日 ${timeDesc} 提醒`);
+			return;
+		}
+
+		// 检测简单定时任务请求，服务器端直接创建（不依赖 Agent）
+		const simpleScheduleMatch = text.match(/^(\d+)(分钟|小时)后\s*(?:提醒|通知)?(?:我)?\s*(.+)$/i);
+		if (simpleScheduleMatch) {
+			const [, num, unit, taskMessage] = simpleScheduleMatch;
+			const minutes = unit === '小时' ? parseInt(num) * 60 : parseInt(num);
+			const runAtMs = Date.now() + minutes * 60 * 1000;
+			const runAt = new Date(runAtMs);
+			
+			// 检测是否为新闻推送请求
+			const isNewsRequest = /推送|发送/.test(taskMessage) && /热点|新闻|热榜/.test(taskMessage);
+			let finalMessage: string;
+			let taskName: string;
+
+			console.log(`[定时] 解析任务: "${text}" → taskMessage="${taskMessage}" isNewsRequest=${isNewsRequest}`);
+
+			if (isNewsRequest) {
+				// 提取条数（默认 15 条）
+				const topNMatch = taskMessage.match(/(\d+)\s*条/);
+				const topN = topNMatch ? Math.min(50, Math.max(1, parseInt(topNMatch[1], 10))) : 15;
+				finalMessage = JSON.stringify({ type: 'fetch-news', options: { topN } });
+				taskName = '热点新闻推送';
+				console.log(`[定时] → 创建新闻推送任务，topN=${topN}`);
+			} else {
+				finalMessage = taskMessage.trim();
+				taskName = `${num}${unit}后提醒`;
+				console.log(`[定时] → 创建普通提醒任务`);
+			}
+			
+			const task = await scheduler.add({
+				name: taskName,
+				enabled: true,
+				deleteAfterRun: true,
+				schedule: { kind: 'at', at: runAt.toISOString() },
+				message: finalMessage,
+				platform: 'dingtalk',
+				webhook: sessionWebhook,
+			});
+			
+			const timeStr = runAt.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+			const content = isNewsRequest ? `今日热点新闻（前 ${JSON.parse(finalMessage).options.topN} 条）` : taskMessage;
+			await sendMarkdown(sessionWebhook, `✅ 已设置好，大约在 **${timeStr}** 通过钉钉提醒你：\n\n${content}\n\n发送 \`/cron\` 可查看所有任务。`, '⏰ 定时任务已创建');
+			console.log(`[任务] 服务器端创建: ${task.name} @ ${timeStr}`);
+			return;
+		}
+		
+		// 解析项目路由（传入 intent 避免重复检测）
+		let { workspace, message, label, intent } = resolveWorkspace(text, currentProject, routeIntent);
+
+		// 检测定时任务请求，强制使用 cursor-remote-control 工作区（规则文件所在）
+		const isScheduleRequest = /([0-9]+|一|二|三|四|五|六|七|八|九|十)(分钟|小时|天|周|月).*(后|提醒|通知|告诉)|每(天|周|月|小时).*[提醒通知]|定时/i.test(text);
+		if (isScheduleRequest) {
+			workspace = ROOT;
+			console.log(`[路由] 定时任务请求 → 强制使用全局工作区: ${workspace}`);
+		}
+
+		// 临时路由提示
+		if (intent.type === 'temp') {
+			console.log(`[路由] 临时路由到项目: ${label}`);
+		}
+		
+		// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+		// 命令系统
+		// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+		
+		// /help、/帮助 → 显示所有可用命令
+		const helpMatch = message.trim().match(/^\/(help|帮助|指令)\s*$/i);
+		if (helpMatch) {
+			const en = helpMatch[1].toLowerCase() === 'help';
+			const c = (zh: string, enAlias?: string) => en && enAlias ? `\`${zh}\` \`${enAlias}\`` : `\`${zh}\``;
+			const helpText = [
+				'**基础指令**',
+				`- ${c('/帮助', '/help')} — 显示本帮助`,
+				`- ${c('/状态', '/status')} — 查看服务状态`,
+				`- ${c('/项目', '/project')} — 列出所有项目及路径`,
+				`- ${c('/新对话', '/new')} — 重置当前会话`,
+				`- ${c('/终止 [项目名]', '/stop')} — 终止正在执行的任务（可指定项目）`,
+				'',
+				'**热点 / 新闻**',
+				`- ${c('/新闻', '/news')} — **立即推送**今日热点（直接发 \`/新闻\`）；定时例：\`/新闻 每天9点 推送10条\``,
+				`- ${c('/新闻状态', '/news status')} — 各数据源是否可用`,
+				'- 也可说：「每天9点推送热点」「30分钟后推送10条新闻」等自动建定时任务',
+				'',
+				'**会话管理**',
+				`- ${c('/会话', '/sessions')} — 查看最近会话列表`,
+				'- `/会话 编号` — 切换到指定会话',
+				`- ${c('/新对话', '/new')} — 归档当前会话，开启新对话`,
+				'',
+				'**模型与密钥**',
+				`- ${c('/模型', '/model')} — 查看/切换 AI 模型`,
+				`- ${c('/密钥', '/apikey')} — 查看/更换 API Key（仅私聊）`,
+				'  用法：`/密钥 key_xxx...`',
+				'',
+				'**记忆系统**',
+				`- ${c('/记忆', '/memory')} — 查看记忆状态`,
+				`- \`/记忆 关键词\` — 语义搜索记忆`,
+				`- \`/记录 内容\` — 写入今日日记`,
+				`- ${c('/整理记忆', '/reindex')} — 重建记忆索引`,
+				'',
+				'**定时任务**',
+				`- ${c('/任务', '/cron')} — 查看/暂停/恢复/删除/执行（含热点推送任务）`,
+				'- 热点定时见上文 **热点 / 新闻**；其它定时也可说「每天早上9点提醒我XX」',
+				'',
+			'**心跳系统**',
+			`- ${c('/心跳', '/heartbeat')} — 查看心跳状态`,
+			'- `/心跳 开启/关闭/执行`',
+			'- `/心跳 间隔 分钟数`',
+			'',
+			'**项目路由**',
+				'· 对话切换：说「切到 remote」「切换到 XXX 项目」等可持久切换',
+				'· 前缀指定：`项目名:消息` 或 `#项目名 消息`',
+				'· 示例（长按复制）：',
+				'```',
+				'remote:帮我看看这个bug',
+				'```',
+				`· 可用项目：${Object.keys(projectsConfig.projects).map(k => `\`${k}\``).join('、')}（默认：\`${projectsConfig.default_project}\`）`,
+				'',
+				'**工具：**',
+				`- ${c('/发送文件', '/sendfile')} <路径> — 发送本地文件（别名 /send）`,
+				'',
+				'**系统：**',
+				'- 启动自检：服务启动时自动执行 `.cursor/BOOT.md`',
+				'- 出生仪式：首次对话触发 `.cursor/BOOTSTRAP.md`（自动删除）',
+				'- 工作区初始化：自动复制模板文件到 `.cursor/`',
+				'',
+				'**体验优化：**',
+				'- ⏱️ 自动显示执行耗时',
+				'- 🔄 余额不足自动降级（无需干预）',
+				'- 💡 错误时显示修复建议',
+			].join('\n');
+			await sendMarkdown(sessionWebhook, helpText, '📖 使用帮助', 'blue');
+			return;
+		}
+		
+		// /status、/状态 → 服务状态一览
+		if (/^\/(status|状态)\s*$/i.test(message.trim())) {
+			const keyPreview = config.DINGTALK_APP_KEY ? `\`...${config.DINGTALK_APP_KEY.slice(-8)}\`` : '**未设置**';
+			const projects = Object.entries(projectsConfig.projects).map(([k, v]) => `  \`${k}\` → ${v.path}`).join('\n');
+			const sessions = [...sessionsStore.entries()]
+				.filter(([, s]) => s.active)
+				.map(([ws, s]) => {
+					const name = Object.entries(projectsConfig.projects).find(([, v]) => v.path === ws)?.[0] || ws;
+					return `  \`${name}\` → ${s.active!.slice(0, 12)}...`;
+				}).join('\n') || '  (无活跃会话)';
+			
+			const memStatus = memory
+				? (() => {
+					const stats = memory.getStats();
+					return `${stats.chunks} 块（${stats.files} 文件, ${stats.cachedEmbeddings} 嵌入缓存）`;
+				})()
+				: '未初始化';
+			
+			const statusText = [
+				`**AppKey：** ${keyPreview}`,
+				`**记忆：** ${memStatus}`,
+				`**调度：** ${(() => { const s = scheduler.getStats(); return s.total > 0 ? `${s.enabled}/${s.total} 任务${s.nextRunIn ? `（下次: ${s.nextRunIn}）` : ''}` : '无任务'; })()}`,
+				`**心跳：** ${heartbeat.getStatus().enabled ? `每 ${Math.round(heartbeat.getStatus().everyMs / 60000)} 分钟` : '未启用'}`,
+				`**活跃任务：** ${busySessions.size} 个运行中`,
+				`**工作区：** ${memoryWorkspace}`,
+				`**模板：** ${existsSync(resolve(TEMPLATE_DIR, 'AGENTS.md')) ? '✅ 已就绪' : '❌ 缺失'}`,
+				`**BOOT：** ${existsSync(resolve(memoryWorkspace, '.cursor/BOOT.md')) ? '✅' : '❌'}`,
+				`**BOOTSTRAP：** ${existsSync(resolve(memoryWorkspace, '.cursor/BOOTSTRAP.md')) ? '🎂 待触发' : '已完成'}`,
+				'',
+				'**项目路由：**',
+				projects,
+				'',
+				'**活跃会话：**',
+				sessions,
+			].join('\n');
+			await sendMarkdown(sessionWebhook, statusText, '📊 服务状态', 'blue');
+			return;
+		}
+
+		// /新闻状态、/news status → 新闻源健康状态（必须在 /新闻 之前检查）
+		const newsStatusMatch = message.match(/^\/(新闻状态|news\s+status)[\s:：]*$/i);
+		if (newsStatusMatch) {
+			const status = getHealthStatus();
+			await sendMarkdown(sessionWebhook, status, '📊 新闻源健康状态', 'blue');
+			return;
+		}
+
+		// /新闻、/news → 立即推送或创建定时任务
+		if (message.match(/^\/(新闻|news)\s*/i)) {
+			const args = message.replace(/^\/(新闻|news)\s*/i, '').trim();
+			let topN = 15;
+			const topMatch = args.match(/(?:推送|前|top)\s*(\d+)\s*条/i) ?? args.match(/(\d+)\s*条/i);
+			if (topMatch) topN = Math.min(50, Math.max(1, parseInt(topMatch[1], 10)));
+
+			// 支持多种时间表达式
+			const dailyMatch = args.match(/每天\s*([0-9一二三四五六七八九十]+)\s*[点时]/);
+			const tomorrowMatch = args.match(/明天\s*(上午|下午)?\s*([0-9一二三四五六七八九十]+)\s*[点时]/);
+			const minutesMatch = args.match(/(\d+)\s*分钟[后以]后/);
+			const hoursMatch = args.match(/(\d+)\s*[个小]时[后以]后/);
+
+			// 如果没有时间表达式，立即执行推送
+			if (!minutesMatch && !hoursMatch && !dailyMatch && !tomorrowMatch) {
+				await sendMarkdown(sessionWebhook, `📰 正在抓取热点新闻...`, '🔄 处理中', 'blue');
+				try {
+					const { messages } = await fetchNews({ topN, platform: 'dingtalk' });
+					
+					if (messages.length === 0) {
+						await sendMarkdown(sessionWebhook, `❌ 未获取到新闻数据`, '失败', 'red');
+						return;
+					}
+
+					// 多条消息分批发送
+					const chunks = typeof messages === 'string' ? [messages] : messages;
+					for (let i = 0; i < chunks.length; i++) {
+						const title = chunks.length > 1 ? `📰 今日热点 (${i + 1}/${chunks.length})` : '📰 今日热点';
+						await sendMarkdown(sessionWebhook, chunks[i], title, 'green');
+					}
+				} catch (error) {
+					await sendMarkdown(sessionWebhook, `❌ 推送失败\n\n${error instanceof Error ? error.message : String(error)}`, '失败', 'red');
+				}
+				return;
+			}
+
+			// 有时间表达式，创建定时任务
+			const numMap: Record<string, number> = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
+			const toNum = (s: string) => (numMap[s] ?? parseInt(s, 10)) || 9;
+			let schedule: { kind: 'cron'; expr: string; tz?: string } | { kind: 'at'; at: string };
+			let timeDesc: string;
+
+			if (minutesMatch) {
+				// X分钟后
+				const minutes = parseInt(minutesMatch[1], 10);
+				const d = new Date(Date.now() + minutes * 60 * 1000);
+				schedule = { kind: 'at', at: d.toISOString() };
+				timeDesc = `${minutes}分钟后（${d.toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Shanghai' })}）`;
+			} else if (hoursMatch) {
+				// X小时后
+				const hours = parseInt(hoursMatch[1], 10);
+				const d = new Date(Date.now() + hours * 60 * 60 * 1000);
+				schedule = { kind: 'at', at: d.toISOString() };
+				timeDesc = `${hours}小时后（${d.toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Shanghai' })}）`;
+			} else if (dailyMatch) {
+				// 每天X点
+				const hour = toNum(dailyMatch[1]);
+				schedule = { kind: 'cron', expr: `0 ${hour} * * *`, tz: 'Asia/Shanghai' };
+				timeDesc = `每天 ${hour}:00`;
+			} else if (tomorrowMatch) {
+				// 明天X点
+				const ap = tomorrowMatch[1];
+				let hour = toNum(tomorrowMatch[2]);
+				if (ap === '下午') hour = (hour % 12) + 12;
+				const d = new Date();
+				d.setDate(d.getDate() + 1);
+				d.setHours(hour, 0, 0, 0);
+				schedule = { kind: 'at', at: d.toISOString() };
+				timeDesc = `明天 ${hour}:00`;
+			}
+			const msg = JSON.stringify({ type: 'fetch-news', options: { topN } });
+			await scheduler.add({
+				name: '热点新闻推送',
+				enabled: true,
+				deleteAfterRun: false,
+				schedule: schedule!,
+				message: msg,
+				platform: 'dingtalk',
+				webhook: sessionWebhook,
+			});
+			await sendMarkdown(
+				sessionWebhook,
+				`✅ 已创建定时任务\n\n⏰ 执行时间：${timeDesc!}\n📰 推送内容：今日热点新闻（前 ${topN} 条）\n📱 到时会通过**钉钉**提醒你\n\n发送 \`/任务\` 可查看所有任务`,
+				'⏰ 定时任务已创建',
+				'green'
+			);
+			return;
+		}
+		
+		// /new、/新对话、/新会话 → 归档当前会话，开启新对话
+		if (/^\/(new|新对话|新会话)\s*$/i.test(message.trim())) {
+			archiveAndResetSession(workspace);
+			// 清空内存中的 agentId，确保下次对话不会 --resume
+			session.agentId = undefined;
+			const historyCount = getSessionHistory(workspace).length;
+			const hint = historyCount > 0 ? `\n\n历史会话已保留（共 ${historyCount} 个），发送 \`/会话\` 可查看和切换。` : '';
+			await sendMarkdown(sessionWebhook, `**[${label}]** 新会话已开始，下一条消息将创建全新对话。${hint}`, '🆕 新会话', 'green');
+			return;
+		}
+		
+		// /会话、/sessions → 列出历史会话 / 切换会话
+		const sessionCmdMatch = message.match(/^\/(会话|sessions?)[\s:：]*(.*)/i);
+		if (sessionCmdMatch) {
+			const subArg = sessionCmdMatch[2].trim();
+			const history = getSessionHistory(workspace, 10);
+			const activeId = getActiveSessionId(workspace);
+			
+			if (!subArg) {
+				if (history.length === 0) {
+					await sendMarkdown(sessionWebhook, '暂无历史会话。\n\n开始对话后会自动记录，发送 `/新对话` 可归档当前会话。', '💬 会话列表');
+					return;
+				}
+				const lines: string[] = [];
+				lines.push(`**工作区：** \`${label}\`\n`);
+				for (let i = 0; i < history.length; i++) {
+					const h = history[i];
+					const isCurrent = h.id === activeId;
+					const icon = isCurrent ? '🔵' : '⚪';
+					const tag = isCurrent ? ' ← **当前**' : '';
+					const time = formatRelativeTime(h.lastActiveAt);
+					lines.push(`${icon} **${i + 1}.** ${h.summary}${tag}\n   ${time} · \`${h.id.slice(0, 8)}\``);
+				}
+				lines.push('', '---', '切换：`/会话 编号`　　新建：`/新对话`');
+				await sendMarkdown(sessionWebhook, lines.join('\n'), '💬 会话列表', 'blue');
+				return;
+			}
+			
+			// /会话 N → 切换到第 N 个
+			const num = Number.parseInt(subArg, 10);
+			if (!Number.isNaN(num) && num >= 1 && num <= history.length) {
+				const target = history[num - 1];
+				if (target.id === activeId) {
+					await sendMarkdown(sessionWebhook, `当前已是会话 #${num}：${target.summary}`, '无需切换');
+					return;
+				}
+				switchToSession(workspace, target.id);
+				// 同步更新内存中的 agentId
+				session.agentId = target.id;
+				await sendMarkdown(sessionWebhook, `已切换到会话 #${num}：**${target.summary}**\n\n下一条消息将在此会话中继续对话。\n\`${target.id.slice(0, 12)}\` · ${formatRelativeTime(target.lastActiveAt)}`, '💬 已切换', 'green');
+				console.log(`[Session] 切换到 ${target.id.slice(0, 12)} (${target.summary})`);
+				return;
+			}
+			
+			// /会话 ID前缀 → 按 ID 前缀匹配
+			if (subArg.length >= 4) {
+				const target = history.find(h => h.id.startsWith(subArg));
+				if (target) {
+					switchToSession(workspace, target.id);
+					// 同步更新内存中的 agentId
+					session.agentId = target.id;
+					await sendMarkdown(sessionWebhook, `已切换到：**${target.summary}**\n\n\`${target.id.slice(0, 12)}\` · ${formatRelativeTime(target.lastActiveAt)}`, '💬 已切换');
+					return;
+				}
+			}
+			
+			await sendMarkdown(sessionWebhook, `未找到编号 ${subArg} 的会话。\n\n发送 \`/会话\` 查看可用列表。`, '❓ 未找到');
+			return;
+		}
+		
+		// /model、/模型 → 切换模型
+		const modelMatch = message.match(/^\/(model|模型|切换模型)[\s:：=]*(.*)/i);
+		if (modelMatch) {
+			const input = modelMatch[2].trim();
+			
+			// 无参数 → 显示模型列表
+			if (!input) {
+				await sendMarkdown(sessionWebhook, buildModelListCard(config.CURSOR_MODEL), '🤖 选择模型', 'blue');
+				return;
+			}
+			
+			const { exact, candidates } = fuzzyMatchModel(input);
+			
+			if (exact) {
+				// 精确匹配或唯一模糊匹配 → 直接切换
+				if (exact.id === config.CURSOR_MODEL) {
+					await sendMarkdown(sessionWebhook, `当前已是 **${exact.id}**（${exact.desc}），无需切换。`, '🤖 当前模型');
+					return;
+				}
+				const envContent = readFileSync(ENV_PATH, 'utf-8');
+				const updated = envContent.match(/^CURSOR_MODEL=/m)
+					? envContent.replace(/^CURSOR_MODEL=.*$/m, `CURSOR_MODEL=${exact.id}`)
+					: `${envContent.trimEnd()}\nCURSOR_MODEL=${exact.id}\n`;
+				writeFileSync(ENV_PATH, updated);
+				const prev = config.CURSOR_MODEL;
+				await sendMarkdown(sessionWebhook, `${prev} → **${exact.id}**（${exact.desc}）\n\n已写入 .env，2 秒内自动生效。`, '✅ 模型已切换', 'green');
+				console.log(`[指令] 模型切换: ${prev} → ${exact.id}`);
+				return;
+			}
+			
+			if (candidates.length > 1) {
+				const list = candidates.map(m => `- \`${m.id}\`（${m.desc}）`).join('\n');
+				await sendMarkdown(sessionWebhook, `「${input}」匹配到多个模型：\n\n${list}\n\n请输入更精确的名称或编号。`, '⚠️ 请精确选择', 'orange');
+				return;
+			}
+			
+			// 列表外的自定义模型名
+			if (input.length < 2 || /^\d+$/.test(input)) {
+				await sendMarkdown(sessionWebhook, buildModelListCard(config.CURSOR_MODEL, `「${input}」无匹配，请从列表中选择`), '❌ 未找到模型');
+				return;
+			}
+			
+			const envContent = readFileSync(ENV_PATH, 'utf-8');
+			const updated = envContent.match(/^CURSOR_MODEL=/m)
+				? envContent.replace(/^CURSOR_MODEL=.*$/m, `CURSOR_MODEL=${input}`)
+				: `${envContent.trimEnd()}\nCURSOR_MODEL=${input}\n`;
+			writeFileSync(ENV_PATH, updated);
+			const prev = config.CURSOR_MODEL;
+			await sendMarkdown(sessionWebhook, `${prev} → **${input}**\n\n⚠️ 此模型不在常用列表中，若名称有误可能导致执行失败。\n发送 \`/模型\` 查看常用列表。`, '⚠️ 模型已切换', 'orange');
+			console.log(`[指令] 模型切换(自定义): ${prev} → ${input}`);
+			return;
+		}
+		
+		// /apikey、/密钥 → 更换 API Key（仅私聊）
+		const apikeyMatch = message.match(/^\/(apikey|密钥|api-key)[\s:：=]*(key_[a-zA-Z0-9_-]+)?/i);
+		if (apikeyMatch) {
+			const rawKey = apikeyMatch[2]?.trim();
+			if (!rawKey) {
+				const preview = config.CURSOR_API_KEY ? `\`...${config.CURSOR_API_KEY.slice(-8)}\`` : '**未设置**';
+				await sendMarkdown(sessionWebhook, `**当前 API Key：** ${preview}\n\n用法：\`/密钥 key_xxx...\``, '🔑 API Key', 'blue');
+				return;
+			}
+			// 群聊安全检查
+			if (isGroup) {
+				await sendMarkdown(sessionWebhook, '⚠️ **安全提醒：请勿在群聊中发送 API Key！**\n\n请在与机器人的 **私聊** 中发送 `/密钥` 指令。', '⚠️ 安全提醒', 'red');
+				return;
+			}
+			try {
+				const envContent = readFileSync(ENV_PATH, 'utf-8');
+				const updated = envContent.match(/^CURSOR_API_KEY=/m)
+					? envContent.replace(/^CURSOR_API_KEY=.*$/m, `CURSOR_API_KEY=${rawKey}`)
+					: `${envContent.trimEnd()}\nCURSOR_API_KEY=${rawKey}\n`;
+				writeFileSync(ENV_PATH, updated);
+				await sendMarkdown(sessionWebhook, `**API Key 已更换**\n\n新 Key: \`...${rawKey.slice(-8)}\`\n\n已写入 .env 并自动生效。`, '✅ Key 已更新', 'green');
+				console.log(`[指令] API Key 已通过钉钉更换 (...${rawKey.slice(-8)})`);
+			} catch (err) {
+				await sendMarkdown(sessionWebhook, `❌ 写入失败: ${err instanceof Error ? err.message : err}`, '❌ 失败');
+			}
+			return;
+		}
+		
+		// /stop、/终止、/停止 → 终止当前会话运行的 agent
+		if (/^\/(stop|终止|停止)(?:\s+(.+))?$/i.test(message.trim())) {
+			const match = message.trim().match(/^\/(stop|终止|停止)(?:\s+(.+))?$/i);
+			const projectHint = match?.[2]?.trim();
+			
+			// 辅助函数：根据 lockKey 反向查找项目名
+			const getProjectNameByLockKey = (lockKey: string): string | null => {
+				const wsPath = lockKey.startsWith('session:') 
+					? null
+					: lockKey.replace(/^ws:/, '');
+				
+				if (wsPath) {
+					for (const [name, info] of Object.entries(projectsConfig.projects)) {
+						if (info.path === wsPath) return name;
+					}
+				}
+				return null;
+			};
+			
+			// 如果指定了项目名，优先使用
+			if (projectHint && projectsConfig.projects[projectHint]) {
+				const wsPath = projectsConfig.projects[projectHint].path;
+				const lk = getLockKey(wsPath);
+				const agent = activeAgents.get(lk);
+				if (agent) {
+					agent.kill();
+					console.log(`[指令] 终止 agent pid=${agent.pid} project=${projectHint} session=${lk}`);
+					await sendMarkdown(sessionWebhook, `✅ 已终止项目 **${projectHint}** 的任务。\n\n发送新消息将继续在当前会话中对话。`, '✅ 已终止');
+				} else {
+					await sendMarkdown(sessionWebhook, `ℹ️ 项目 **${projectHint}** 没有正在运行的任务。`, 'ℹ️ 无任务', 'grey');
+				}
+				return;
+			}
+			
+			// 否则，智能查找所有运行中的 agent
+			const runningAgents = Array.from(activeAgents.entries());
+			
+			if (runningAgents.length === 0) {
+				await sendMarkdown(sessionWebhook, '当前没有正在运行的任务。', 'ℹ️ 无任务', 'grey');
+			} else if (runningAgents.length === 1) {
+				// 只有一个任务，直接停止
+				const [lockKey, agent] = runningAgents[0];
+				const projectName = getProjectNameByLockKey(lockKey);
+				agent.kill();
+				console.log(`[指令] 终止 agent pid=${agent.pid} session=${lockKey}`);
+				
+				const msg = projectName 
+					? `✅ 已终止项目 **${projectName}** 的任务。\n\n发送新消息将继续在当前会话中对话。`
+					: `✅ 已终止任务（PID: ${agent.pid}）。\n\n发送新消息将继续在当前会话中对话。`;
+				await sendMarkdown(sessionWebhook, msg, '✅ 已终止');
+			} else {
+				// 多个任务，提示用户选择
+				const list = runningAgents
+					.map(([lk, agent]) => {
+						const projectName = getProjectNameByLockKey(lk);
+						return projectName 
+							? `- 项目: **${projectName}** (PID: ${agent.pid})`
+							: `- 任务 PID: ${agent.pid}`;
+					})
+					.join('\n');
+				
+				await sendMarkdown(
+					sessionWebhook,
+					`⚠️ 当前有 **${runningAgents.length}** 个任务正在运行：\n\n${list}\n\n请使用 \`/stop 项目名\` 指定要停止的任务。`,
+					'⚠️ 多个任务'
+				);
+			}
+			return;
+		}
+
+		// /发送文件、/sendfile、/send → 上传本地文件到钉钉
+		if (/^\/(发送文件|sendfile|send)\s+/i.test(message.trim())) {
+			const filePathMatch = message.match(/^\/(发送文件|sendfile|send)\s+(.+)$/i);
+			if (!filePathMatch) {
+				await sendMarkdown(sessionWebhook, '用法：`/发送文件 <文件路径>`\n\n示例：\n- `/发送文件 ~/Desktop/app.apk`\n- `/send ~/Documents/report.pdf`', 'ℹ️ 用法');
+				return;
+			}
+
+			let filePath = filePathMatch[2].trim();
+
+			// 展开 ~
+			if (filePath.startsWith('~')) {
+				filePath = filePath.replace('~', HOME);
+			}
+
+			// 检查文件
+			if (!existsSync(filePath)) {
+				await sendMarkdown(sessionWebhook, `❌ 文件不存在：\`${filePath}\``, '文件不存在');
+				return;
+			}
+
+			const stats = statSync(filePath);
+			const fileSize = stats.size;
+			const maxSize = 30 * 1024 * 1024;
+
+			if (fileSize > maxSize) {
+				await sendMarkdown(sessionWebhook, `❌ 文件过大：${(fileSize / 1024 / 1024).toFixed(2)}MB > 30MB`, '文件过大');
+				return;
+			}
+
+			// 上传中提示
+			const fileName = filePath.split('/').pop() || 'file';
+			await sendMarkdown(sessionWebhook, `📤 正在上传文件：\`${fileName}\`\n\n大小：${(fileSize / 1024 / 1024).toFixed(2)}MB`, '上传中');
+
+			try {
+				// 确保 token 有效
+				await ensureToken();
+
+				// 上传文件
+				const { uploadFileDingtalk, sendFileDingtalk } = await import('./send-file-dingtalk.js');
+				const { mediaId } = await uploadFileDingtalk({
+					filePath,
+					accessToken,
+					type: 'file',
+				});
+
+				// 发送文件
+				await sendFileDingtalk(sessionWebhook, mediaId, fileName);
+
+				await sendMarkdown(sessionWebhook, `✅ 文件发送成功：\`${fileName}\``, '发送成功');
+				console.log(`[文件] 已发送: ${fileName}`);
+			} catch (error) {
+				await sendMarkdown(sessionWebhook, `❌ 发送失败：${error instanceof Error ? error.message : String(error)}`, '发送失败');
+				console.error('[文件] 发送失败:', error);
+			}
+			return;
+		}
+		
+		// /任务、/cron → 定时任务管理
+		const taskMatch = message.match(/^\/(任务|cron|定时|task|schedule|定时任务)[\s:：]*(.*)/i);
+		if (taskMatch) {
+			const subCmd = taskMatch[2].trim().toLowerCase();
+
+			// 无参数 → 列出所有任务
+			if (!subCmd) {
+				// 直接从文件读取最新任务（避免 reload 的 3 秒保护机制）
+				const cronFilePath = resolve(ROOT, 'cron-jobs-dingtalk.json');
+				let jobs: any[] = [];
+				try {
+					const data = JSON.parse(readFileSync(cronFilePath, 'utf-8'));
+					jobs = (data.jobs || []).filter((j: any) => j.platform === 'dingtalk');
+				} catch (e) {
+					console.warn(`[任务] 读取文件失败: ${e}`);
+				}
+				
+				if (jobs.length === 0) {
+					await sendMarkdown(sessionWebhook, '暂无定时任务。\n\n在对话中说「每天早上9点做XX」，AI 会自动创建任务。', '📋 定时任务');
+					return;
+				}
+				const lines = jobs.map((j: any, i: number) => {
+					const status = j.enabled ? '✅' : '⏸️';
+					let schedDesc = "";
+					if (j.schedule.kind === 'at') {
+						const atTime = new Date(j.schedule.at);
+						schedDesc = `一次性 ${atTime.toLocaleString("zh-CN", { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}`;
+					} else if (j.schedule.kind === 'every') {
+						schedDesc = `每 ${Math.round(j.schedule.everyMs / 60000)} 分钟`;
+					} else {
+						try {
+							const humanReadable = humanizeCronInChinese(j.schedule.expr);
+							schedDesc = `${humanReadable}\n   表达式: \`${j.schedule.expr}\``;
+						} catch {
+							schedDesc = `cron: ${j.schedule.expr}`;
+						}
+					}
+					const lastRun = j.state?.lastRunAtMs ? new Date(j.state.lastRunAtMs).toLocaleString('zh-CN') : '从未执行';
+					const content = j.message ? `\n   内容: ${j.message}` : "";
+					return `${status} **${i + 1}. ${j.name}**\n   调度: ${schedDesc}${content}\n   上次: ${lastRun}\n   ID（复制用）：\n\`\`\`\n${j.id}\n\`\`\``;
+				});
+				lines.push('', `📊 共 ${jobs.length} 个待执行任务`);
+				await sendMarkdown(sessionWebhook, lines.join('\n'), '📋 定时任务');
+				return;
+			}
+			
+			// /任务 暂停 ID
+			const pauseMatch = subCmd.match(/^(暂停|pause|disable)\s+(\S+)/i);
+			if (pauseMatch) {
+				const idPrefix = pauseMatch[2];
+				const job = (await scheduler.list(true)).find(j => j.id.startsWith(idPrefix));
+				if (!job) {
+					await sendMarkdown(sessionWebhook, `未找到 ID 前缀为 \`${idPrefix}\` 的任务`, '❓ 未找到');
+					return;
+				}
+				await scheduler.update(job.id, { enabled: false });
+				await sendMarkdown(sessionWebhook, `已暂停: **${job.name}**`, '⏸️ 已暂停', 'orange');
+				return;
+			}
+			
+			// /任务 恢复 ID
+			const resumeMatch = subCmd.match(/^(恢复|resume|enable)\s+(\S+)/i);
+			if (resumeMatch) {
+				const idPrefix = resumeMatch[2];
+				const job = (await scheduler.list(true)).find(j => j.id.startsWith(idPrefix));
+				if (!job) {
+					await sendMarkdown(sessionWebhook, `未找到 ID 前缀为 \`${idPrefix}\` 的任务`, '❓ 未找到');
+					return;
+				}
+				await scheduler.update(job.id, { enabled: true });
+				await sendMarkdown(sessionWebhook, `已恢复: **${job.name}**`, '✅ 已恢复', 'green');
+				return;
+			}
+			
+			// /任务 删除 ID
+			const delMatch = subCmd.match(/^(删除|delete|remove|del)\s+(\S+)/i);
+			if (delMatch) {
+				const idPrefix = delMatch[2];
+				const job = (await scheduler.list(true)).find(j => j.id.startsWith(idPrefix));
+				if (!job) {
+					await sendMarkdown(sessionWebhook, `未找到 ID 前缀为 \`${idPrefix}\` 的任务`, '❓ 未找到');
+					return;
+				}
+				scheduler.remove(job.id);
+				await sendMarkdown(sessionWebhook, `已删除: **${job.name}**`, '🗑️ 已删除', 'green');
+				return;
+			}
+			
+			// /任务 执行 ID
+			const runMatch = subCmd.match(/^(执行|run|trigger)\s+(\S+)/i);
+			if (runMatch) {
+				const idPrefix = runMatch[2];
+				const job = (await scheduler.list(true)).find(j => j.id.startsWith(idPrefix));
+				if (!job) {
+					await sendMarkdown(sessionWebhook, `未找到 ID 前缀为 \`${idPrefix}\` 的任务`, '❓ 未找到');
+					return;
+				}
+				await sendMarkdown(sessionWebhook, `⏳ 正在手动执行：**${job.name}**\n\n执行结果稍后推送...`, '⏳ 执行中', 'wathet');
+				scheduler.run(job.id).catch(err => {
+					console.error('[任务执行失败]', err);
+				});
+				return;
+			}
+			
+			await sendMarkdown(sessionWebhook, '未知子命令。\n\n用法：\n- `/任务` — 查看所有任务\n- `/任务 暂停 ID` — 暂停任务\n- `/任务 恢复 ID` — 恢复任务\n- `/任务 删除 ID` — 删除任务\n- `/任务 执行 ID` — 手动执行', 'ℹ️ 用法');
+			return;
+		}
+		
+		// /记忆、/memory → 记忆系统操作
+		const memoryMatch = message.match(/^\/(记忆|memory|搜索记忆|recall)[\s:：=]*(.*)/i);
+		if (memoryMatch) {
+			if (!memory) {
+				await sendMarkdown(sessionWebhook, '记忆系统未初始化（缺少向量嵌入 API Key）。\n\n请在 `.env` 中设置 `VOLC_EMBEDDING_API_KEY`。', '⚠️ 记忆不可用');
+				return;
+			}
+			const query = memoryMatch[2].trim();
+			if (!query) {
+				const summary = memory.getRecentSummary(3);
+				const stats = memory.getStats();
+				const fileList = stats.filePaths.length > 0
+					? stats.filePaths.slice(0, 25).map((p) => `- \`${p}\``).join('\n') + (stats.filePaths.length > 25 ? `\n- …及其他 ${stats.filePaths.length - 25} 个文件` : '')
+					: '（尚未索引，请发送 `/整理记忆`）';
+				const statusText = [
+					`**记忆索引：** ${stats.chunks} 块（${stats.files} 文件, ${stats.cachedEmbeddings} 嵌入缓存）`,
+					`**索引范围：** 工作区全部文本文件（.md .txt .html .json .mdc 等）`,
+					`**嵌入模型：** ${config.VOLC_EMBEDDING_MODEL}`,
+					'',
+					'**用法：**',
+					'- `/记忆 关键词` — 语义搜索记忆',
+					'- `/记录 内容` — 写入今日日记',
+					'- `/整理记忆` — 重建全工作区索引',
+					'',
+					`**已索引文件：**\n${fileList}`,
+					'',
+					summary ? `**最近记忆摘要：**\n\n${summary.slice(0, 1500)}` : '（暂无记忆文件）',
+				].join('\n');
+				await sendMarkdown(sessionWebhook, statusText, '🧠 记忆系统', 'purple');
+				return;
+			}
+			try {
+				const results = await memory.search(query, 5);
+				if (results.length === 0) {
+					await sendMarkdown(sessionWebhook, `未找到与「${query}」相关的记忆。\n\n索引范围：工作区全部文本文件（发 \`/整理记忆\` 可刷新）`, '❌ 无匹配');
+					return;
+				}
+				const lines = results.map((r, i) =>
+					`**${i + 1}.** \`${r.path}#L${r.startLine}\`（相关度 ${(r.score * 100).toFixed(0)}%）\n${r.text.slice(0, 300)}`,
+				);
+				await sendMarkdown(sessionWebhook, lines.join('\n\n---\n\n'), `🔍 搜索「${query}」`, 'purple');
+			} catch (e) {
+				await sendMarkdown(sessionWebhook, `搜索失败: ${e instanceof Error ? e.message : e}`, '❌ 失败');
+			}
+			return;
+		}
+		
+		// /记录 → 快速写入今日日记
+		const logMatch = message.match(/^\/(记录|log|note)[\s:：=]+(.+)/is);
+		if (logMatch) {
+			if (!memory) {
+				await sendMarkdown(sessionWebhook, '记忆系统未初始化。', '⚠️ 不可用');
+				return;
+			}
+			const content = logMatch[2].trim();
+			const path = memory.appendDailyLog(content);
+			await sendMarkdown(sessionWebhook, `已记录到今日日记。\n\n\`${path}\``, '📝 已记录', 'green');
+			return;
+		}
+		
+		// /整理记忆 → 重建全工作区记忆索引
+		if (/^\/(整理记忆|reindex|索引)\s*$/i.test(message.trim())) {
+			if (!memory) {
+				await sendMarkdown(sessionWebhook, '记忆系统未初始化。', '⚠️ 不可用');
+				return;
+			}
+			await sendMarkdown(sessionWebhook, '⏳ 正在扫描并索引工作区全部文本文件...', '⏳ 索引中', 'wathet');
+			try {
+				const count = await memory.index();
+				const stats = memory.getStats();
+				const msg = [
+					`索引完成: **${count}** 个记忆块（来自 **${stats.files}** 个文件）`,
+					`嵌入缓存: ${stats.cachedEmbeddings} 条`,
+					`嵌入模型: \`${config.VOLC_EMBEDDING_MODEL}\``,
+					'',
+					'**已索引文件：**',
+					...stats.filePaths.slice(0, 25).map((p) => `- \`${p}\``),
+					...(stats.filePaths.length > 25 ? [`- …及其他 ${stats.filePaths.length - 25} 个文件`] : []),
+				].join('\n');
+				await sendMarkdown(sessionWebhook, msg, '✅ 索引完成', 'green');
+			} catch (e) {
+				await sendMarkdown(sessionWebhook, `索引失败: ${e instanceof Error ? e.message : e}`, '❌ 失败');
+			}
+			return;
+		}
+		
+		// /心跳 → 心跳系统管理
+		const hbMatch = message.match(/^\/(心跳|heartbeat|hb)[\s:：]*(.*)/i);
+		if (hbMatch) {
+			const subCmd = hbMatch[2].trim().toLowerCase();
+			
+			if (!subCmd || subCmd === 'status' || subCmd === '状态') {
+				const s = heartbeat.getStatus();
+				const statusText = [
+					`**状态：** ${s.enabled ? '✅ 已启用' : '⏸ 已关闭'}`,
+					`**间隔：** ${Math.round(s.everyMs / 60000)} 分钟`,
+					s.nextRunAt ? `**下次执行：** ${new Date(s.nextRunAt).toLocaleString('zh-CN')}` : '',
+					s.lastRunAt ? `**上次执行：** ${new Date(s.lastRunAt).toLocaleString('zh-CN')}` : '',
+					'',
+					'**用法：**',
+					'- `/心跳 开启` — 启动心跳检查',
+					'- `/心跳 关闭` — 停止心跳检查',
+					'- `/心跳 执行` — 立即执行一次',
+					'- `/心跳 间隔 分钟数` — 设置间隔',
+					'',
+					'编辑工作区的 `.cursor/HEARTBEAT.md` 可自定义检查清单。',
+				].filter(Boolean).join('\n');
+				await sendMarkdown(sessionWebhook, statusText, '💓 心跳系统', 'purple');
+				return;
+			}
+			
+			if (/^(开启|enable|on|start|启动)$/i.test(subCmd)) {
+				heartbeat.updateConfig({ enabled: true });
+				await sendMarkdown(sessionWebhook, `心跳已开启，每 ${Math.round(heartbeat.getStatus().everyMs / 60000)} 分钟检查一次。\n\n编辑 \`.cursor/HEARTBEAT.md\` 自定义检查清单。`, '💓 已开启', 'green');
+				return;
+			}
+			
+			if (/^(关闭|disable|off|stop|停止)$/i.test(subCmd)) {
+				heartbeat.updateConfig({ enabled: false });
+				await sendMarkdown(sessionWebhook, '心跳已关闭。', '💓 已关闭', 'grey');
+				return;
+			}
+			
+			if (/^(执行|run|check|检查)$/i.test(subCmd)) {
+				await sendMarkdown(sessionWebhook, '💓 正在执行心跳检查...', '⏳ 执行中', 'wathet');
+				const result = await heartbeat.runOnce();
+				if (result.status === 'ran') {
+					await sendMarkdown(sessionWebhook, result.hasContent ? '心跳检查完成，发现需要关注的事项（已发送）' : '心跳检查完成，一切正常 ✅', '💓 检查完成', 'green');
+				} else {
+					await sendMarkdown(sessionWebhook, result.message || '检查跳过', '💓 已跳过');
+				}
+				return;
+			}
+			
+			const intervalMatch = subCmd.match(/^(?:间隔|interval)\s+(\d+)$/i);
+			if (intervalMatch) {
+				const mins = Number.parseInt(intervalMatch[1], 10);
+				if (mins < 1 || mins > 1440) {
+					await sendMarkdown(sessionWebhook, '间隔范围: 1-1440 分钟', '⚠️ 无效');
+					return;
+				}
+				heartbeat.updateConfig({ everyMs: mins * 60_000 });
+				await sendMarkdown(sessionWebhook, `心跳间隔已设为 **${mins} 分钟**`, '💓 已更新');
+				return;
+			}
+			
+			await sendMarkdown(sessionWebhook, '未知子命令。发送 `/心跳` 查看用法。', 'ℹ️ 用法');
+			return;
+		}
+		
+		// 未知指令 → 友好提示
+		if (message.startsWith('/')) {
+			const cmd = message.split(/[\s:：]/)[0];
+			await sendMarkdown(sessionWebhook, `未知指令 \`${cmd}\`\n\n发送 \`/帮助\` 查看所有可用指令。`, '❓ 未知指令');
+			return;
+		}
+		
+		// 调用 Cursor（并发控制）
+		const lockKey = getLockKey(workspace);
+		
+		// 检查是否有同会话任务运行中（用于显示排队提示）
+		const hasLock = sessionLocks.has(lockKey);
+		const isBusy = busySessions.has(lockKey) || hasLock;
+		
+		if (isBusy) {
+			await sendMarkdown(sessionWebhook, '⏳ 排队中（同会话有任务进行中）\n\n请稍候...', '⏸️ 排队中', 'orange');
+			console.log(`[并发] 会话 ${lockKey} 已在运行，等待中...`);
+		}
+		
+		// 使用会话锁确保串行执行
+		await withSessionLock(lockKey, async () => {
+			busySessions.add(lockKey);
+	
+	console.log(`[执行] workspace=${workspace} message="${message.slice(0, 60)}"`);
+	
+	await sendMarkdown(sessionWebhook, '⏳ Cursor AI 正在思考...', '💭 思考中', 'wathet');
+	
+	// 记忆由 Cursor 自主通过 memory-tool.ts 调用，server 记录会话日志
+	if (memory) {
+		memory.appendSessionLog(workspace, "user", message, config.CURSOR_MODEL);
+	}
+	
+	// ── 出生仪式检查 ─────────────────────────────────
+	let isBootstrap = false;
+	const bootstrapPath = resolve(workspace, ".cursor/BOOTSTRAP.md");
+	if (existsSync(bootstrapPath)) {
+		// 读取 BOOTSTRAP.md 内容，当前仅用于非空判断
+		// 未来可考虑将内容注入 prompt（类似 BOOT.md 实现）
+		const bootstrapContent = readFileSync(bootstrapPath, "utf-8").trim();
+		if (bootstrapContent) {
+			console.log("[出生仪式] 检测到 BOOTSTRAP.md，首次对话");
+			
+			// 将用户消息和出生仪式结合
+			const combinedPrompt = [
+				"🎂 这是你的第一次对话（出生仪式）。",
+				"",
+				"请阅读 .cursor/BOOTSTRAP.md 的指引，然后回应用户的消息。",
+				"",
+				`用户说：${message}`,
+			].join("\n");
+			
+			// 使用组合提示词
+			message = combinedPrompt;
+			isBootstrap = true;
+		}
+	}
+	
+	try {
+		const agentStart = Date.now();
+		
+		const { result, quotaWarning } = await runAgent(workspace, message, session.agentId, {
+			platform: 'dingtalk',
+			webhook: sessionWebhook,
+			onSessionId: (sid) => {
+				session.agentId = sid;
+				setActiveSession(workspace, sid, message.slice(0, 40));
+			},
+		});
+		
+		const agentElapsedMs = Date.now() - agentStart;
+		const elapsed = formatElapsed(Math.round(agentElapsedMs / 1000));
+		const title = quotaWarning ? `⚠️ 完成 · ${elapsed}（已降级）` : `✅ 完成 · ${elapsed}`;
+		console.log(`[完成] model=${quotaWarning ? 'auto' : config.CURSOR_MODEL} elapsed=${elapsed} (${result.length} chars)`);
+
+			// 如果是出生仪式，删除 BOOTSTRAP.md
+			if (isBootstrap) {
+				try {
+					unlinkSync(resolve(workspace, ".cursor/BOOTSTRAP.md"));
+					console.log("[出生仪式] BOOTSTRAP.md 已删除，出生仪式完成");
+				} catch (e) {
+					console.warn(`[出生仪式] 删除 BOOTSTRAP.md 失败: ${e}`);
+				}
+			}
+
+		let cleanOutput = result.trim();
+		if (quotaWarning) {
+			cleanOutput = `${quotaWarning}\n\n---\n\n${cleanOutput}`;
+		}
+			
+			// 记录 assistant 回复到会话日志
+			if (memory) {
+				memory.appendSessionLog(workspace, "assistant", cleanOutput.slice(0, 3000), config.CURSOR_MODEL);
+			}
+			
+			// Agent 可能修改了 cron-jobs，检查并修正位置
+			await fixCronJobsLocation(workspace, sessionWebhook);
+			
+			// 重新加载调度器
+			scheduler.reload().catch(() => {});
+			
+			// 发送结果
+			if (cleanOutput) {
+				// 分片发送（钉钉 Markdown 有长度限制）
+				const chunks = splitMarkdown(cleanOutput, 4000);
+				const completionColor = quotaWarning ? 'orange' : 'green';
+				for (let i = 0; i < chunks.length; i++) {
+					const chunkTitle = chunks.length > 1
+						? (i === chunks.length - 1 ? title : `Cursor AI (${i + 1}/${chunks.length})`)
+						: title;
+					await sendMarkdown(sessionWebhook, chunks[i], chunkTitle, completionColor);
+					if (i < chunks.length - 1) {
+						await new Promise(resolve => setTimeout(resolve, 500));
+					}
+				}
+			} else {
+				await sendMarkdown(sessionWebhook, '✅ 任务已完成（无输出）', title, quotaWarning ? 'orange' : 'green');
+			}
+		} finally {
+			busySessions.delete(lockKey);
+		}
+		}); // 闭合 withSessionLock
+		
+	} catch (error) {
+		const msg = error instanceof Error ? error.message : String(error);
+		console.error(`[失败] ${msg.slice(0, 200)}`);
+
+		if (!sessionWebhook) {
+			console.error('[失败] 无 webhook，无法发送错误引导');
+			return;
+		}
+
+		// API Key 失效引导
+		if (/api.?key|authentication|unauthorized|invalid.*key/i.test(msg)) {
+			const guide =
+				`❌ **API Key 失效**\n\n` +
+				`请更换 Key：\n\n` +
+				`1. 打开 [Cursor Dashboard](https://cursor.com/dashboard)\n` +
+				`2. 生成新 Key\n` +
+				`3. 发送 \`/密钥 新Key\`\n\n` +
+				`错误详情：\n\`\`\`\n${msg.slice(0, 200)}\n\`\`\``;
+
+			try {
+				await sendMarkdown(sessionWebhook, guide, '❌ Key 失效', 'red');
+			} catch (sendErr) {
+				console.error('[sendMarkdown 失败]', sendErr);
+			}
+			return;
+		}
+
+		// 超时错误引导
+		if (/timeout|超时|timed out/i.test(msg)) {
+			const guide =
+				`❌ **执行超时**\n\n` +
+				`任务执行超时，请检查任务复杂度或网络状况。\n\n` +
+				`建议：\n` +
+				`- 将任务拆分为更小的步骤\n` +
+				`- 使用 \`/stop\` 手动终止长任务`;
+
+			try {
+				await sendMarkdown(sessionWebhook, guide, '❌ 超时', 'red');
+			} catch (sendErr) {
+				console.error('[sendMarkdown 失败]', sendErr);
+			}
+			return;
+		}
+
+		// 通用错误
+		try {
+			await sendMarkdown(sessionWebhook, `❌ 执行失败\n\n\`\`\`\n${msg.slice(0, 500)}\n\`\`\`\n\n发送 \`/帮助\` 查看可用命令。`, '❌ 失败', 'red');
+		} catch (sendErr) {
+			console.error('[sendMarkdown 失败]', sendErr);
+		}
+	}
+}
+
+// ── 调度回调 ───────────────────────────────────
+async function onScheduledTaskExecute(result: string, webhook: string, title?: string) {
+	if (result && result.length > 0) {
+		if (result.length <= 3800) {
+			await sendMarkdown(webhook, result, title, 'green');
+		} else {
+			await sendMarkdown(webhook, result.slice(0, 3800) + '\n\n...(已截断)', title, 'orange');
+		}
+	}
+}
+
+// ── 分片工具 ─────────────────────────────────────
+function splitMarkdown(text: string, maxLen: number): string[] {
+	if (text.length <= maxLen) return [text];
+	
+	const chunks: string[] = [];
+	let current = '';
+	
+	for (const line of text.split('\n')) {
+		if (current.length + line.length + 1 > maxLen) {
+			chunks.push(current);
+			current = line;
+		} else {
+			current += (current ? '\n' : '') + line;
+		}
+	}
+	
+	if (current) chunks.push(current);
+	return chunks;
+}
+
+// ── 定时任务调度器 ────────────────────────────────
+// 钉钉独立的 cron-jobs.json（保存在固定的全局目录）
+const cronStorePath = resolve(ROOT, 'cron-jobs-dingtalk.json');
+
+const scheduler = new Scheduler({
+	storePath: cronStorePath,
+	defaultWorkspace,
+	onExecute: async (job: CronJob) => {
+		// 新闻推送任务：动态抓取并格式化
+		const msg = job.message;
+		const isNews =
+			msg === "fetch-news" ||
+			msg === '{"type":"fetch-news"}' ||
+			(typeof msg === "string" && msg.startsWith('{"type":"fetch-news"'));
+		if (isNews) {
+			try {
+				let topN = 15;
+				if (typeof msg === "string" && msg.startsWith("{")) {
+					try {
+						const parsed = JSON.parse(msg) as { type?: string; options?: { topN?: number } };
+						topN = parsed.options?.topN ?? 15;
+					} catch {}
+				}
+				console.log(`[scheduler] fetching news, topN=${topN}`);
+				const { messages } = await fetchNews({ topN, platform: "dingtalk" });
+				console.log(`[scheduler] news fetched, ${messages.length} batch(es)`);
+				if (messages.length > 1) {
+					return { status: "ok" as const, result: JSON.stringify({ chunks: messages }) };
+				}
+				return { status: "ok" as const, result: messages[0] ?? "" };
+			} catch (err) {
+				console.error(`[scheduler] news fetch failed:`, err);
+				const fallback = `⚠️ 热点抓取失败\n\n${err instanceof Error ? err.message : String(err)}\n\n稍后会自动重试`;
+				return { status: "error" as const, error: String(err), result: fallback };
+			}
+		}
+		// 普通提醒任务
+		console.log(`[scheduler] task triggered: ${job.name}`);
+		return { status: 'ok' as const, result: job.message };
+	},
+	onDelivery: async (job: CronJob, result: string) => {
+		// 优先使用任务中保存的 webhook（确保发送到创建任务的平台）
+		const webhook = job.webhook || getWebhook();
+		if (!webhook) {
+			console.warn('[scheduler] no active webhook, skip delivery (user must send at least one message first)');
+			return;
+		}
+
+		// 只有钉钉创建的任务才发送到钉钉
+		if (job.platform && job.platform !== 'dingtalk') {
+			console.log(`[scheduler] task ${job.name} belongs to ${job.platform}, skip dingtalk delivery`);
+			return;
+		}
+
+		// 多消息分片：result 为 JSON { chunks: string[] }（新闻任务）
+		let chunks: string[] | null = null;
+		try {
+			const parsed = JSON.parse(result) as { chunks?: string[] };
+			if (parsed && Array.isArray(parsed.chunks) && parsed.chunks.length > 0) {
+				chunks = parsed.chunks;
+			}
+		} catch {}
+
+		if (chunks) {
+			for (let i = 0; i < chunks.length; i++) {
+				const title = chunks.length > 1 ? `📰 今日热点 (${i + 1}/${chunks.length})` : "📰 今日热点";
+				await sendMarkdown(webhook, chunks[i], title, 'blue');
+				if (i < chunks.length - 1) {
+					await new Promise(r => setTimeout(r, 500));
+				}
+			}
+			console.log(`[scheduler] dingtalk news sent: ${chunks.length} chunk(s)`);
+		} else {
+			// 发送提醒内容（优化格式）
+			const now = new Date();
+			const timeStr = now.toLocaleString('zh-CN', {
+				month: '2-digit',
+				day: '2-digit',
+				hour: '2-digit',
+				minute: '2-digit',
+				hour12: false
+			});
+			const content = `**${result}**\n\n⏱ 提醒时间：${timeStr}\n📌 任务名称：${job.name}`;
+			await sendMarkdown(webhook, content, '⏰ 定时提醒');
+			console.log(`[scheduler] dingtalk reminder sent: ${result}`);
+		}
+	},
+	log: (msg: string) => console.log(`[调度] ${msg}`),
+});
+
+// ── 启动 ─────────────────────────────────────────
+console.log(`
+┌──────────────────────────────────────────────────┐
+│  钉钉 → Cursor Agent 中继服务 v3.0               │
+├──────────────────────────────────────────────────┤
+│  模型: ${config.CURSOR_MODEL}
+│  Key:  ${config.CURSOR_API_KEY ? `...${config.CURSOR_API_KEY.slice(-8)}` : '(未设置)'}
+│  连接: 钉钉 Stream 长连接
+│  收件: ${INBOX_DIR}
+│  记忆: ${memory ? `与飞书共享（${config.VOLC_EMBEDDING_MODEL}）` : '未初始化'}
+│  调度: cron-jobs-dingtalk.json (全局目录)
+│  心跳: 默认关闭（/心跳 开启）
+│
+│  项目路由:
+${Object.entries(projectsConfig.projects).map(([k, v]) => `│    /${k} → ${v.path}`).join('\n')}
+│
+│  ✅ 已支持:
+│    - 消息: 文本、语音、图片、文件
+│    - 路由: 传统(/project) + 对话式(切换到/# /@)
+│    - 命令: /帮助 /状态 /新闻 /任务 /新对话 /会话 /模型 /密钥 /终止
+│    - 会话: 持久化、历史、切换
+│    - 记忆: 语义搜索、日志记录、全工作区索引（与飞书共享）
+│    - 心跳: 定期检查、主动推送
+│    - 定时: cron-jobs-dingtalk.json
+│
+│  ⏸️ 暂不支持:
+│    - 实时进度（平台限制：钉钉不支持消息更新）
+└──────────────────────────────────────────────────┘
+`);
+
+// ── 启动前校验：未配置钉钉凭据则直接退出 ─────────────
+if (!config.DINGTALK_APP_KEY?.trim() || !config.DINGTALK_APP_SECRET?.trim()) {
+	console.error('[致命] 钉钉机器人未配置，无法建立连接。');
+	console.error('  请在 dingtalk/.env 中设置:');
+	console.error('    DINGTALK_APP_KEY=你的AppKey');
+	console.error('    DINGTALK_APP_SECRET=你的AppSecret');
+	console.error('  参考: cp .env.example .env 后编辑，或查看 README');
+	process.exit(1);
+}
+
+// ── 钉钉 Stream 客户端 ───────────────────────────
+const client = new DWClient({
+	clientId: config.DINGTALK_APP_KEY,
+	clientSecret: config.DINGTALK_APP_SECRET,
+});
+
+client.registerCallbackListener(TOPIC_ROBOT, async (res) => {
+	console.log('[回调] 收到钉钉推送');
+	try {
+		await handleMessage(res);
+		console.log('[回调] 处理完成，返回 200');
+		return { code: 200, message: 'OK' };
+	} catch (error) {
+		console.error('[回调异常]', error);
+		return {
+			code: 500,
+			message: error instanceof Error ? error.message : String(error)
+		};
+	}
+});
+
+await refreshAccessToken();
+await client.connect();
+console.log('钉钉 Stream 连接已建立，等待消息...');
+
+// ── 启动定时任务调度器 ────────────────────────────
+console.log('[scheduler] starting...');
+scheduler.start().catch((err) => {
+	console.error('[scheduler] start failed:', err);
+});
+console.log(`[scheduler] started, file: ${cronStorePath}`);
+
+// ── 启动心跳系统 ──────────────────────────────────
+heartbeat.start();
+console.log(`[心跳] 已启动，默认关闭（发送 /心跳 开启）`);
+
+// ── 启动自检（.cursor/BOOT.md）───────────────────────
+setTimeout(async () => {
+	const bootPath = resolve(memoryWorkspace, ".cursor/BOOT.md");
+	try {
+		if (!existsSync(bootPath)) return;
+		const content = readFileSync(bootPath, "utf-8").trim();
+		if (!content) return;
+
+		console.log("[启动] 检测到 .cursor/BOOT.md，执行启动自检...");
+
+		const bootPrompt = [
+			"你正在执行启动自检。严格按以下清单执行：",
+			"",
+			content,
+			"",
+			"如果无事可做，回复 'HEARTBEAT_OK'。",
+		].join("\n");
+
+		const { result, quotaWarning } = await runAgent(memoryWorkspace, bootPrompt);
+		const trimmed = result.trim();
+		const finalResult = quotaWarning ? `${quotaWarning}\n\n---\n\n${trimmed}` : trimmed;
+
+		// 如果有需要推送的内容且有活跃 webhook
+		if (finalResult && !/^(无输出|HEARTBEAT_OK)$/i.test(trimmed)) {
+			const webhook = getWebhook();
+			if (webhook) {
+				await sendMarkdown(webhook, finalResult, '🚀 启动自检', 'wathet');
+				console.log("[启动] 自检结果已推送到钉钉");
+			}
+		}
+
+		console.log("[启动] .cursor/BOOT.md 自检完成");
+	} catch (e) {
+		console.warn(`[启动] .cursor/BOOT.md 执行失败: ${e}`);
+	}
+}, BOOT_DELAY_MS);

